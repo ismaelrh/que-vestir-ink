@@ -1,0 +1,1198 @@
+{%- comment %}
+Note to self:
+This plugin picks an outfit sprite for the current weather
+and shows a short hint about how the rest of the day will change.
+
+Below I set up:
+- sprite base URLs
+- form field values (location, sarcasm level, future hints)
+- shared time info (local time, day stamp)
+- weather band + outfit slug
+- future window and scenario
+- text libraries for each scenario and sarcasm level
+- final layout
+
+Scenario logic v2:
+Temp hints are now classified by DESTINATION zone, not just direction.
+- zone(t): cold if t <= 7, hot if t > 27, else mid
+- warmer -> variant by zone(max_temp_future): warmer_cold / warmer / warmer_hot
+- colder -> variant by zone(min_temp_future): colder_hot / colder_mid / colder
+- temp_state additionally gated on a band change (delta alone is not enough)
+- detection is sequence aware: when both a significant warm up and a
+  significant cool down exist in the window, the EARLIER one wins
+- warm up followed by significant cool down maps to the arc scenario
+  (shed layers midday, want them back in the evening)
+- combo scenarios fall back to plain precip scenario when the temp flavor
+  contradicts the destination zone (wetter_warmer with cold dest -> wetter, etc.)
+- forecast horizon is now fixed (end of active day) instead of time boxed,
+  because sequence aware detection removes the evening cool off bias
+{%- endcomment %}
+
+{%- comment %}
+Note to self:
+Assign sprite URLs.
+{%- endcomment %}
+{%- assign sprite_base_url  = 'https://raw.githubusercontent.com/nikokoren/what-to-wear/refs/heads/main/' -%}
+{%- assign error_sprite_url = 'https://raw.githubusercontent.com/nikokoren/what-to-wear/refs/heads/main/404.png' -%}
+
+{%- comment %}
+Note to self:
+Read custom field values from the TRMNL settings.
+Using default filter to handle nil values efficiently.
+{%- endcomment %}
+{%- assign location_label_raw = trmnl.plugin_settings.custom_fields_values.location_label | default: '' -%}
+{%- assign latitude_str = trmnl.plugin_settings.custom_fields_values.latitude | default: '' -%}
+{%- assign longitude_str = trmnl.plugin_settings.custom_fields_values.longitude | default: '' -%}
+{%- assign show_future_suggestions_raw = trmnl.plugin_settings.custom_fields_values.show_future_suggestions | default: 'on' -%}
+{%- assign language_raw = trmnl.plugin_settings.custom_fields_values.language | default: 'es' -%}
+{%- assign sarcasm_level_raw = trmnl.plugin_settings.custom_fields_values.sarcasm_level | default: '0' -%}
+{%- assign show_bottom_bar = trmnl.plugin_settings.custom_fields_values.show_bottom_bar | default: 'on' -%}
+
+{%- comment %}
+Note to self:
+Normalise show_future_suggestions to "on" or "off"
+{%- endcomment %}
+{%- assign show_future_suggestions = 'on' -%}
+{%- assign sfs_check = show_future_suggestions_raw | downcase | strip -%}
+{%- if sfs_check == 'no' or sfs_check == 'false' or sfs_check == '0' -%}
+  {%- assign show_future_suggestions = 'off' -%}
+{%- endif -%}
+
+{%- comment %}
+Note to self:
+Normalise language to "en", "de", or "es".
+Fallback to Peruvian Spanish.
+{%- endcomment -%}
+{%- assign lang = language_raw | downcase | strip -%}
+{%- if lang != 'de' and lang != 'en' and lang != 'es' -%}
+  {%- assign lang = 'es' -%}
+{%- endif -%}
+
+{%- comment %}
+Note to self:
+Normalise sarcasm_level to one of "0", "10", "11".
+{%- endcomment %}
+{%- assign sarcasm_level = '0' -%}
+{%- assign sarc_check = sarcasm_level_raw | strip -%}
+{%- if sarc_check == '10' or sarc_check == '11' -%}
+  {%- assign sarcasm_level = sarc_check -%}
+{%- endif -%}
+
+{%- comment %}
+Note to self:
+If the user did not give a label, I show nothing in the title bar.
+{%- endcomment %}
+{%- assign location_label = location_label_raw -%}
+
+{%- comment %}
+Note to self:
+Get current weather and hourly objects from the Open Meteo recipe.
+If either is missing, I treat it as an error and show an error message.
+{%- endcomment %}
+{%- assign cw = current -%}
+{%- assign h = hourly -%}
+{%- assign is_error = false -%}
+{%- assign error_message = '' -%}
+
+{%- if cw == nil -%}
+  {%- assign is_error = true -%}
+  {%- if lang == 'de' -%}
+    {%- assign error_message = 'Wetterdaten konnten nicht abgerufen werden. Bitte versuche es spÃ¤ter erneut.' -%}
+  {%- elsif lang == 'es' -%}
+    {%- assign error_message = 'No se pudieron cargar los datos del clima. Intenta de nuevo más tarde.' -%}
+  {%- else -%}
+    {%- assign error_message = 'Unable to retrieve weather data. Please try again later.' -%}
+  {%- endif -%}
+{%- elsif h == nil -%}
+  {%- assign is_error = true -%}
+  {%- if lang == 'de' -%}
+    {%- assign error_message = 'Wettervorhersage konnte nicht geladen werden. Bitte versuche es spÃ¤ter erneut.' -%}
+  {%- else -%}
+    {%- assign error_message = 'Unable to load forecast data. Please try again later.' -%}
+  {%- endif -%}
+{%- endif -%}
+
+{%- if is_error and lang == 'es' -%}
+  {%- assign error_message = 'No se pudieron cargar los datos del clima. Intenta de nuevo más tarde.' -%}
+{%- endif -%}
+
+{%- comment %}
+Note to self:
+Shared time info.
+Prefer API time, fallback to device time if unavailable.
+{%- endcomment %}
+{%- assign local_hour = 12 -%}
+{%- assign today_md = '01-01' -%}
+
+{%- if current.time -%}
+  {%- assign local_hour = current.time | slice: 11, 2 | plus: 0 -%}
+  {%- assign today_md = current.time | slice: 5, 5 -%}
+{%- else -%}
+  {%- assign epoch_utc = trmnl.system.timestamp_utc | default: 0 | plus: 0 -%}
+  {%- assign utc_offset = trmnl.user.utc_offset | default: 0 | plus: 0 -%}
+  {%- assign local_secs = epoch_utc | plus: utc_offset -%}
+  {%- assign local_hour = local_secs | divided_by: 3600 | modulo: 24 -%}
+  {%- assign today_md = local_secs | date: '%m-%d' -%}
+{%- endif -%}
+
+{%- comment %}
+Note to self:
+Calculate local_days for hint rotation (uses UTC timestamp for consistency)
+{%- endcomment %}
+{%- assign epoch_utc = trmnl.system.timestamp_utc | default: 0 | plus: 0 -%}
+{%- assign local_days = epoch_utc | divided_by: 86400 -%}
+
+{%- assign dev_width = trmnl.device.width | plus: 0 -%}
+
+{%- assign is_og = false -%}
+
+{%- if dev_width <= 800 -%}
+  {%- assign is_og = true -%}
+{%- endif -%}
+
+{%- comment %}
+Note to self:
+Set up defaults so Liquid never chokes on nil.
+{%- endcomment %}
+{%- assign temp_c = 0 -%}
+{%- assign wmo = 0 -%}
+{%- assign is_now_precip = 0 -%}
+{%- assign band = 'mild' -%}
+{%- assign weather_slug = '' -%}
+
+{%- assign max_temp_future = 0 -%}
+{%- assign min_temp_future = 0 -%}
+{%- assign max_rain_future = 0 -%}
+{%- assign has_future_window = false -%}
+{%- assign max_temp_idx = 0 -%}
+{%- assign min_temp_idx = 0 -%}
+
+{%- assign today_tip = '' -%}
+{%- assign scenario = '' -%}
+{%- assign precip_state = 'none' -%}
+{%- assign temp_state = 'flat' -%}
+{%- assign dest_temp = 0 -%}
+{%- assign dest_zone = 'mid' -%}
+
+{%- if is_error == false -%}
+
+  {%- comment %}
+  Note to self:
+  Read current temperature and WMO code,
+  then decide if it is precipitating right now.
+  Consolidated into single conditional.
+  {%- endcomment %}
+  {%- assign temp_c = cw.apparent_temperature | default: 0 | plus: 0 -%}
+  {%- assign wmo = cw.weather_code | default: 0 | plus: 0 -%}
+
+  {%- if wmo >= 51 and wmo <= 67 or wmo >= 71 and wmo <= 77 or wmo >= 80 and wmo <= 82 or wmo >= 95 -%}
+    {%- assign is_now_precip = 1 -%}
+  {%- endif -%}
+
+  {%- comment %}
+  Note to self:
+  Map current temperature to a band.
+  I use this band name for the outfit sprite.
+  {%- endcomment %}
+  {%- if temp_c <= 0 -%}
+    {%- assign band = 'freezing' -%}
+  {%- elsif temp_c <= 7 -%}
+    {%- assign band = 'cold' -%}
+  {%- elsif temp_c <= 14 -%}
+    {%- assign band = 'cool' -%}
+  {%- elsif temp_c <= 20 -%}
+    {%- assign band = 'mild' -%}
+  {%- elsif temp_c <= 27 -%}
+    {%- assign band = 'warm' -%}
+  {%- elsif temp_c <= 32 -%}
+    {%- assign band = 'hot' -%}
+  {%- else -%}
+    {%- assign band = 'very_hot' -%}
+  {%- endif -%}
+
+  {%- comment %}
+  Note to self:
+  Turn band plus current precipitation into a base outfit slug.
+  Using string concatenation instead of nested if/elsif.
+  {%- endcomment %}
+  {%- assign precip_suffix = 'dry' -%}
+  {%- if is_now_precip == 1 -%}
+    {%- if band == 'freezing' -%}
+      {%- assign precip_suffix = 'snow' -%}
+    {%- else -%}
+      {%- assign precip_suffix = 'rain' -%}
+    {%- endif -%}
+  {%- endif -%}
+
+  {%- assign weather_slug = band | append: '_' | append: precip_suffix -%}
+
+  {%- comment %}
+  Note to self:
+  Fixed forecast horizon. Detection is now sequence aware
+  (the first significant change wins), so I no longer need
+  the old time of day boxes to suppress the evening cool off bias.
+  - Look until the end of the active day (day_end_hour)
+  - Always keep at least a 3 hour window in the evening
+  - Never look past 23:00
+  {%- endcomment %}
+
+  {%- assign day_end_hour = 21 -%}
+  {%- assign cutoff_hour = day_end_hour -%}
+  {%- assign min_cutoff = local_hour | plus: 3 -%}
+  {%- if min_cutoff > cutoff_hour -%}
+    {%- assign cutoff_hour = min_cutoff -%}
+  {%- endif -%}
+  {%- if cutoff_hour > 23 -%}
+    {%- assign cutoff_hour = 23 -%}
+  {%- endif -%}
+
+  {%- if cutoff_hour > local_hour -%}
+    {%- assign temps = h.apparent_temperature -%}
+    {%- assign probs = h.precipitation_probability -%}
+    {%- assign h_count = temps | size | default: 0 -%}
+
+    {%- if temps != nil and probs != nil and h_count > 0 -%}
+      {%- assign start_index = local_hour | plus: 1 -%}
+      {%- assign end_index = cutoff_hour -%}
+      {%- assign last_index = h_count | minus: 1 -%}
+
+      {%- if start_index <= end_index and start_index <= last_index -%}
+        {%- if end_index > last_index -%}
+          {%- assign end_index = last_index -%}
+        {%- endif -%}
+
+        {%- assign has_future_window = true -%}
+        {%- assign max_temp_future = temp_c -%}
+        {%- assign min_temp_future = temp_c -%}
+        {%- assign max_temp_idx = start_index -%}
+        {%- assign min_temp_idx = start_index -%}
+        {%- assign max_rain_future = 0 -%}
+
+        {%- for t in temps -%}
+          {%- assign i = forloop.index0 -%}
+          {%- if i >= start_index and i <= end_index -%}
+            {%- assign tv = t | plus: 0 -%}
+            {%- if tv > max_temp_future -%}
+              {%- assign max_temp_future = tv -%}
+              {%- assign max_temp_idx = i -%}
+            {%- endif -%}
+            {%- if tv < min_temp_future -%}
+              {%- assign min_temp_future = tv -%}
+              {%- assign min_temp_idx = i -%}
+            {%- endif -%}
+          {%- endif -%}
+        {%- endfor -%}
+
+        {%- for p in probs -%}
+          {%- assign i = forloop.index0 -%}
+          {%- if i >= start_index and i <= end_index -%}
+            {%- assign pv = p | default: 0 | plus: 0 -%}
+            {%- if pv > max_rain_future -%}
+              {%- assign max_rain_future = pv -%}
+            {%- endif -%}
+          {%- endif -%}
+        {%- endfor -%}
+
+      {%- else -%}
+        {%- assign has_future_window = false -%}
+      {%- endif -%}
+    {%- else -%}
+      {%- assign has_future_window = false -%}
+    {%- endif -%}
+    
+  {%- elsif cutoff_hour == local_hour and local_hour == 23 -%}
+    {%- comment %} Special case: At exactly 23:00, just say "perfect" {%- endcomment -%}
+    {%- assign has_future_window = false -%}
+    {%- assign scenario = 'perfect' -%}
+    
+  {%- else -%}
+    {%- assign has_future_window = false -%}
+  {%- endif -%}
+
+  {%- if has_future_window -%}
+
+    {%- comment %}
+    Note to self:
+    Sequence aware temperature detection.
+    A direction only counts as significant if the delta is >= 3
+    AND the destination temperature crosses into a different band
+    (a 3 degree wiggle inside the same band does not deserve a hint).
+    If BOTH directions are significant, the one that happens FIRST wins.
+    Warm up first plus cool down later is the classic arc day and
+    gets its own scenario. Cool down first plus warm up later keeps
+    it simple: the first change (colder) is the primary hint.
+    dest_temp is the temperature the primary hint is heading towards.
+    {%- endcomment %}
+    {%- assign delta_up = max_temp_future | minus: temp_c -%}
+    {%- assign delta_down = temp_c | minus: min_temp_future -%}
+
+    {%- assign warm_significant = false -%}
+    {%- if delta_up >= 3 -%}
+      {%- assign up_band = 'mild' -%}
+      {%- if max_temp_future <= 0 -%}
+        {%- assign up_band = 'freezing' -%}
+      {%- elsif max_temp_future <= 7 -%}
+        {%- assign up_band = 'cold' -%}
+      {%- elsif max_temp_future <= 14 -%}
+        {%- assign up_band = 'cool' -%}
+      {%- elsif max_temp_future <= 20 -%}
+        {%- assign up_band = 'mild' -%}
+      {%- elsif max_temp_future <= 27 -%}
+        {%- assign up_band = 'warm' -%}
+      {%- elsif max_temp_future <= 32 -%}
+        {%- assign up_band = 'hot' -%}
+      {%- else -%}
+        {%- assign up_band = 'very_hot' -%}
+      {%- endif -%}
+      {%- if up_band != band -%}
+        {%- assign warm_significant = true -%}
+      {%- endif -%}
+    {%- endif -%}
+
+    {%- assign cold_significant = false -%}
+    {%- if delta_down >= 3 -%}
+      {%- assign down_band = 'mild' -%}
+      {%- if min_temp_future <= 0 -%}
+        {%- assign down_band = 'freezing' -%}
+      {%- elsif min_temp_future <= 7 -%}
+        {%- assign down_band = 'cold' -%}
+      {%- elsif min_temp_future <= 14 -%}
+        {%- assign down_band = 'cool' -%}
+      {%- elsif min_temp_future <= 20 -%}
+        {%- assign down_band = 'mild' -%}
+      {%- elsif min_temp_future <= 27 -%}
+        {%- assign down_band = 'warm' -%}
+      {%- elsif min_temp_future <= 32 -%}
+        {%- assign down_band = 'hot' -%}
+      {%- else -%}
+        {%- assign down_band = 'very_hot' -%}
+      {%- endif -%}
+      {%- if down_band != band -%}
+        {%- assign cold_significant = true -%}
+      {%- endif -%}
+    {%- endif -%}
+
+    {%- assign temp_state = 'flat' -%}
+    {%- assign dest_temp = temp_c -%}
+    {%- if warm_significant and cold_significant -%}
+      {%- if max_temp_idx <= min_temp_idx -%}
+        {%- assign temp_state = 'arc' -%}
+        {%- assign dest_temp = max_temp_future -%}
+      {%- else -%}
+        {%- assign temp_state = 'colder' -%}
+        {%- assign dest_temp = min_temp_future -%}
+      {%- endif -%}
+    {%- elsif warm_significant -%}
+      {%- assign temp_state = 'warmer' -%}
+      {%- assign dest_temp = max_temp_future -%}
+    {%- elsif cold_significant -%}
+      {%- assign temp_state = 'colder' -%}
+      {%- assign dest_temp = min_temp_future -%}
+    {%- endif -%}
+
+    {%- comment %}
+    Note to self:
+    Destination zone drives which text flavor fits:
+    - cold: dest <= 7 (still coat weather no matter what)
+    - hot: dest > 27 (no layers left to add or remove)
+    - mid: everything in between (classic layer advice applies)
+    {%- endcomment %}
+    {%- assign dest_zone = 'mid' -%}
+    {%- if dest_temp <= 7 -%}
+      {%- assign dest_zone = 'cold' -%}
+    {%- elsif dest_temp > 27 -%}
+      {%- assign dest_zone = 'hot' -%}
+    {%- endif -%}
+
+    {%- comment %}
+    Note to self:
+    Determine precip_state for hints:
+    - wetter: dry now, rain chance later
+    - drier: wet now, dries out later
+    - none: everything else, including stays_wet
+    {%- endcomment %}
+    {%- assign precip_state = 'none' -%}
+    {%- assign rain_threshold = 20 -%}
+
+    {%- if is_now_precip == 0 -%}
+      {%- if max_rain_future >= rain_threshold -%}
+        {%- assign precip_state = 'wetter' -%}
+      {%- endif -%}
+    {%- else -%}
+      {%- if max_rain_future < rain_threshold -%}
+        {%- assign precip_state = 'drier' -%}
+      {%- endif -%}
+    {%- endif -%}
+
+    {%- comment %}
+    Note to self:
+    Map precip_state, temp_state and dest_zone to scenario.
+    Pure temp scenarios:
+    - arc: warm up first, significant cool down after (layers off, then back on)
+    - warmer_cold: milder but still cold, keep the coat
+    - warmer: the classic shed a layer case (mid destination)
+    - warmer_hot: real heat, shade and hydration
+    - colder: the classic add real warmth case (cold destination)
+    - colder_mid: mild cooldown, one light layer
+    - colder_hot: relief from heat, no layer needed
+    Combos treat arc as its first leg (warmer) and fall back to the
+    plain precip scenario when the temp flavor contradicts the
+    destination zone.
+    {%- endcomment %}
+    {%- assign scenario = 'perfect' -%}
+
+    {%- if precip_state == 'none' -%}
+      {%- if temp_state == 'arc' -%}
+        {%- assign scenario = 'arc' -%}
+      {%- elsif temp_state == 'warmer' -%}
+        {%- if dest_zone == 'cold' -%}
+          {%- assign scenario = 'warmer_cold' -%}
+        {%- elsif dest_zone == 'hot' -%}
+          {%- assign scenario = 'warmer_hot' -%}
+        {%- else -%}
+          {%- assign scenario = 'warmer' -%}
+        {%- endif -%}
+      {%- elsif temp_state == 'colder' -%}
+        {%- if dest_zone == 'hot' -%}
+          {%- assign scenario = 'colder_hot' -%}
+        {%- elsif dest_zone == 'cold' -%}
+          {%- assign scenario = 'colder' -%}
+        {%- else -%}
+          {%- assign scenario = 'colder_mid' -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- else -%}
+      {%- assign scenario = precip_state -%}
+      {%- assign combo_temp = temp_state -%}
+      {%- if combo_temp == 'arc' -%}
+        {%- assign combo_temp = 'warmer' -%}
+      {%- endif -%}
+      {%- if combo_temp == 'warmer' -%}
+        {%- if dest_zone != 'cold' -%}
+          {%- assign scenario = scenario | append: '_warmer' -%}
+        {%- endif -%}
+      {%- elsif combo_temp == 'colder' -%}
+        {%- if dest_zone == 'cold' -%}
+          {%- assign scenario = scenario | append: '_colder' -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endif -%}
+
+  {%- else -%}
+    {%- comment %}
+    Note to self:
+    No usable future window, but no hard error:
+    treat as perfect outfit all day.
+    {%- endcomment %}
+    {%- assign scenario = 'perfect' -%}
+  {%- endif -%}
+
+{%- endif -%}
+
+{%- comment %}
+Note to self:
+Text libraries for each scenario and sarcasm level.
+I store variants in a single string and split into arrays.
+Delimiter "||" must not appear in any text.
+{%- endcomment %}
+
+{%- comment %} Scenario: Perfect {% endcomment %}
+{%- assign hints_perfect_0_en = "Conditions remain stable. You are set for the rest of the day.||The forecast holds steady. No outfit changes needed later.||Conditions stay the same. You can trust this outfit.||Stable weather ahead. Keep your layers as they are.||No surprises incoming. This outfit keeps working.||The weather will hold. Your outfit works the rest of the day.||Forecast stays flat. You can keep wearing this outfit.||Nothing shifts later. No need to adjust a single layer.||Same conditions for the rest of the day. This outfit remains the right choice.||No changes on the horizon. Stay as you are." | split: "||" -%}
+{%- assign hints_perfect_10_en = "The weather is on cruise control. No need to overthink your outfit options.||Boring forecast ahead. Your clothing choice can stay drama-free.||Mother Nature is feeling lazy. Your current look works for the rest of the day.||Nothing changes later. Your outfit will be bored, but still effective.||Shockingly, this outfit actually works the rest of the day.||Forecast update: still nothing. Your outfit can keep pretending this is exciting.||Weather remains committed to doing the bare minimum. So can your wardrobe.||The sky phones it in like a Monday morning work call. Keep the outfit, save the effort.||The forecast has reached a creative standstill. Your outfit will remain correct.||Nothing new develops later. Feel free to stop second-guessing your layers.||Stability all day. Your outfit does not need a backup plan.||This day is on repeat like a broken playlist. Wear the same thing, save the effort.||Weather.exe has stopped responding. Keep wearing what you have.||The atmosphere phoned it in. So can you." | split: "||" -%}
+{%- assign hints_perfect_11_en = "Relentless monotony ahead. You are stuck in this outfit for the rest of the day.||The atmosphere has flatlined. Accept your sartorial destiny and stop touching your layers.||The sky refuses to be interesting. Keep wearing what you have, it will not get better.||The weather refuses to change. Keep what you are wearing, it stays the least bad option.||A void of weather events. Do nothing, wear the same outfit, survive the boredom.||Existence is repetitive, and so is this forecast. Stay put in your current layers.||Nothing moves later. Especially not your outfit, so keep it exactly as is.||Change has been formally denied. Your outfit is sentenced until evening, do not try to appeal.||Nothing will happen later. Not to the weather. Not to your clothes.||Stability becomes tyranny. Keep the same layers and pretend this is freedom.||The sky denies change. Keep your outfit unchanged, because change is not on the menu.||The forecast enters a loop. You and this outfit are trapped together until evening.||The forecast refuses to evolve. You and this outfit are paired until evening.||The forecast is Groundhog Day, but without the charm. Keep the outfit. Do not negotiate with your layers.||Nothing changes. You and this outfit are in a committed relationship until evening.||Weather has become a philosophical concept: unchanging, meaningless, inescapable." | split: "||" -%}
+
+{%- assign hints_perfect_0_de = "Die Lage bleibt stabil. Dein Outfit passt für den gesamten Tag.||Keine Wetteränderung in Sicht. Du kannst so angezogen bleiben.||Der Wetterbericht bleibt ruhig. An deiner Kleidung muss nichts mehr geändert werden.||Konstantes Wetter voraus. Deine Kleidung passt perfekt für den restlichen Tag.||Die Wetterlage bleibt unverändert. Dein aktuelles Outfit funktioniert den ganzen Tag.||Ruhige Aussichten für den weiteren Wetterverlauf. Kleidungstechnisch bist du gut aufgestellt.||Das Wetter hält Kurs. Keine weiteren Anpassungen an deiner Kleidung nötig.||Das Wetter bleibt bis zum Abend stabil. Du kannst bei diesem Outfit bleiben." | split: "||" -%}
+{%- assign hints_perfect_10_de = "Petrus macht heute Dienst nach Vorschrift. Das Outfit passt für den restlichen Tag.||Das Wetter läuft auf Autopilot. Du musst dir keine weiteren Gedanken über dein Outfit machen.||Das Wetter macht keine Experimente. Du kannst so angezogen bleiben.||Kein Wetterdrama in Sicht. Spar dir die Mühe, dich umzuziehen.||Heute passiert wettertechnisch exakt gar nichts. Das Outfit passt für den restlichen Tag.||Prognose: Stillstand. Dein Outfit kann bleiben wie es ist.||Mutter Natur ist heute faul. Dein aktueller Look passt für den Rest des Tages.||Überraschenderweise funktioniert dieses Outfit tatsÃ¤chlich für den Rest des Tages.||Das Wetter ist so motiviert wie Bernd das Brot. Dein Outfit passt für den Rest des Tages." | split: "||" -%}
+{%- assign hints_perfect_11_de = "Der Rest des Tages bleibt todlangweilig. Du steckst in diesen Klamotten fest.||Die Wettergötter haben aufgegeben. Akzeptiere dein modisches Schicksal.||Der Himmel weigert sich, interessant zu sein. Behalte an, was du trägst, es wird nicht besser werden.||Das Wetter weigert sich, sich zu ändern. Behalte an, was du trägst, es bleibt die am wenigsten schlechte Option.||Der Himmel hat resigniert. Behalte dein Outfit, VerÃ¤nderung ist heute verboten.||Stillstand auf allen Ebenen. Akzeptiere dein modisches Schicksal.||Nichts verändert sich. Schon gar nicht dein Outfit.||Mist. Mist. Mist. Das Wetter bleibt scheiße langweilig. Du und dein Outfit seid gefangen." | split: "||" -%}
+
+{%- comment %} Scenario: Warmer (mid destination, the classic shed-a-layer case) {% endcomment %}
+{%- assign hints_warmer_0_en = "Temperatures rise later. Wear layers you can easily remove.||It gets warmer later. Avoid heavy layers you cannot take off.||Heat builds over time. Plan to remove layers later.||It warms up later. Wear layers you can shed easily.||Rising temps ahead. Plan to go lighter as the day progresses.||Later on, it turns milder. Make sure layers are easy to remove.||It warms up later. Choose layers you can remove easily.||Warmer conditions develop later. Keep at least one adjustable layer.||Expect a warmer stretch later. Have a lighter option ready.||Temperatures climb later. Wear layers you can take off." | split: "||" -%}
+{%- assign hints_warmer_10_en = "It heats up later like a packed subway in August. Make sure something can come off easily.||Whatever you're wearing now will trap sweat later. Dress in removable layers.||Don't get attached to your current layers. You'll want them gone soon.||Sunshine arrives later. Plan an exit strategy from your top layer.||It heats up later. Make sure your clothing doesn't overstay its usefulness.||The sun clocks in later like it's getting paid overtime. Wear layers you can dump before overheating.||It warms up later. Build your outfit with an escape route built in.||The forecast says warmer. Your layers say denial. Keep an easy off-ramp.||Heat builds later. Make sure fabric can be shed without regret.||It gets warmer later. Don't let your clothing choices become permanent mistakes.||Feeling attached to those layers? Don't. They'll betray you by mid-afternoon.||The temperature climbs later. Whatever's on top needs an exit strategy.||False. Your jacket will not remain comfortable. Bears, beets, breathable layers.||The thermostat gets ambitious later. Don't trap yourself in fabric.||The warmth creeps in like plot spoilers. Dress defensively." | split: "||" -%}
+{%- assign hints_warmer_11_en = "The sun sharpens its knives later like Gordon Ramsay critiquing your life choices. Shed layers in time or slow-roast on schedule.||Delayed heat incoming. Wear removable layers or marinate in your own regret.||The air turns hostile later. Strip fabric strategically or melt politely in public.||Your current outfit will betray you later. Wear escape-ready layers.||Heat is scheduled later. Drop fabric soon or become your own cautionary tale.||The day turns into a furnace. Shed layers in time or cook slowly in your choices.||Warmth arrives later without asking. Wear layers you can ditch, unless suffering is your brand.||The sun ramps up later. Shed fabric before it starts winning the war.||Temperature climbs later. Your outfit will commit crimes against comfort unless you plan ahead.||Heat arrives later like an overdue plot twist. Wear layers you can peel off before regret sets in.||Temperatures rise later like gas prices after an election. Wear layers you can ditch, unless you enjoy suffering.||It gets hot later like mile 700 in the desert. Layer smart or suffer like a thru-hiker with poor planning.||Thermal escalation is inevitable. Your layers will become liabilities unless they're expendable." | split: "||" -%}
+
+{%- assign hints_warmer_0_de = "Es wird wärmer. Achte darauf, dass du später Schichten ablegen kannst.||Temperaturen steigen später. Ein flexibles Outfit ist empfehlenswert.||Die Sonne kommt später raus. Ein flexibles Outfit ist empfehlenswert.||Es heizt sich später auf. Plane ein, Schichten abzulegen.||Wärmeres Wetter im Anmarsch. Bloß nicht zu warm anziehen.||Im Tagesverlauf steigen die Temperaturen weiter. Leichte Kleidung zahlt sich aus.||Es wird spürbar milder. Plane ein, Schichten abzulegen.||Höhere Temperaturen später am Tag. Plane ein, Schichten abzulegen." | split: "||" -%}
+{%- assign hints_warmer_10_de = "Später wird geschwitzt. Der Zwiebellook ist heute Pflicht.||Nicht zu dick einpacken, sonst endest du als Schmorbraten.||Die Heizung wird später aufgedreht. Trag Schichten, die du problemlos ablegen kannst.||Später wird's warm. Stell sicher, dass Stoff abgelegt werden kann, ohne Drama.||Saunaalarm. Bau dir einen Notausgang aus deinen Klamotten.||Dein Körper wird später dankbar sein, wenn du nicht zu viel anhast.||Das Wetter dreht später hoch. Plane eine Flucht aus deinen oberen Schichten.||Später wird geschwitzt. Schichten sind keine Option, sondern Überlebensstrategie.||Später wird's warm. Schaff lieber schon mal Schichten weg, bevor du anfängst zu schwitzen wie im Ländle im Hochsommer." | split: "||" -%}
+{%- assign hints_warmer_11_de = "Die Sonne hasst dich später. Wirf Schichten ab oder geh ein.||Die Sonne wetzt schon die Messer. Trag ablegbare Lagen, sonst garst du vor dich hin.||Hitze ist später fest eingeplant. Wirf rechtzeitig Stoff ab, sonst wirst du zur Warnung für andere.||Die Wärme kommt später mit Ansage. Trag Schichten zum Abwerfen, außer du stehst auf Leiden.||Später heizt es auf. Wirf Lagen ab, bevor dein Outfit zum Beweisstück wird.||Später kommt die Hitze wie ein überfälliger Plot-Twist. Trag Schichten zum Abziehen, bevor du deine Entscheidungen bereust." | split: "||" -%}
+
+{%- comment %} Scenario: Warmer Cold (milder later, but the destination is still cold: keep the coat) {% endcomment %}
+{%- assign hints_warmer_cold_0_en = "It turns slightly milder later, but stays cold. Keep the warm layers on.||Temperatures rise a bit, yet it remains cold. No need to change anything.||A small warm up is coming, but winter layers stay necessary.||It gets less cold later. Your warm outfit still applies.||Milder air arrives later, but not mild enough to shed layers.||The cold eases slightly later. Keep dressing warm anyway.||A few degrees warmer later, still firmly cold. Stay bundled.||Later brings a mild improvement, but the coat stays on." | split: "||" -%}
+{%- assign hints_warmer_cold_10_en = "It warms up later, from freezer to fridge. Keep the coat on.||Technically warmer later. Practically still coat weather. Don't celebrate.||The temperature climbs a few degrees, like a raise that doesn't beat inflation. Stay bundled.||Good news: less cold later. Bad news: still cold. Keep everything on.||It gets milder later, in the way lukewarm coffee is milder. Coat stays.||A gentle thaw later. Your gloves remain employed.||Warmer later, says the forecast. Your goosebumps will disagree. Keep the layers.||The cold loosens its grip slightly. Do not mistake this for spring." | split: "||" -%}
+{%- assign hints_warmer_cold_11_en = "It warms from brutal to merely hostile. Keep every layer, hope is not insulation.||A few degrees of mercy later. Still cold enough to regret everything. Stay wrapped.||The freeze relaxes slightly, like a villain loosening the ropes. You are still cold. Stay bundled.||Warmer later, in the way a crypt is warmer than a glacier. Change nothing.||The forecast promises improvement and delivers crumbs. Keep the coat, trust nothing.||Less cold arrives later. Not comfort. Never comfort. Keep the layers on.||The cold downgrades from punishment to lesson. Your outfit stays exactly as is.||Milder later, allegedly. Your extremities will file a complaint either way. Stay bundled." | split: "||" -%}
+
+{%- assign hints_warmer_cold_0_de = "Es wird später etwas milder, bleibt aber kalt. Behalte die warmen Schichten an.||Die Temperaturen steigen leicht, aber es bleibt kalt. Am Outfit ändert sich nichts.||Später wird es weniger kalt. Deine warme Kleidung bleibt trotzdem nötig.||Eine leichte ErwÃ¤rmung ist in Sicht, aber Winterkleidung bleibt Pflicht.||Es wird ein paar Grad wärmer, bleibt aber deutlich kalt. Bleib warm eingepackt.||Mildere Luft kommt später, aber nicht mild genug zum Ablegen von Schichten.||Die Kälte lässt später etwas nach. Zieh dich trotzdem warm an." | split: "||" -%}
+{%- assign hints_warmer_cold_10_de = "Es wird später wärmer, vom Gefrierfach in den Kühlschrank. Der Mantel bleibt an.||Technisch gesehen wird es wärmer. Praktisch bleibt es Mantelwetter. Freu dich nicht zu früh.||Gute Nachricht: weniger kalt später. Schlechte Nachricht: immer noch kalt. Alles anbehalten.||Ein sanftes Tauwetter später. Deine Handschuhe bleiben im Dienst.||Es wird milder, so wie lauwarmer Kaffee milder ist. Der Mantel bleibt.||Die Kälte lockert später den Griff. Verwechsle das nicht mit Frühling.||Ein paar Grad mehr später, wie eine Gehaltserhöhung unter der Inflation. Bleib eingepackt." | split: "||" -%}
+{%- assign hints_warmer_cold_11_de = "Es wird später wärmer, von brutal zu lediglich feindselig. Behalte jede Schicht an, Hoffnung isoliert nicht.||Ein paar Grad Gnade später. Immer noch kalt genug, um alles zu bereuen. Bleib eingepackt.||Wärmer später, so wie eine Gruft wärmer ist als ein Gletscher. Ändere nichts.||Die Prognose verspricht Besserung und liefert Krümel. Behalte den Mantel, trau niemandem.||Weniger Kälte später. Nicht Komfort. Niemals Komfort. Die Schichten bleiben dran.||Die Kälte wird von Strafe zu Lektion herabgestuft. Dein Outfit bleibt exakt so.||Angeblich wird es milder. Deine Finger werden trotzdem Beschwerde einlegen. Bleib eingepackt." | split: "||" -%}
+
+{%- comment %} Scenario: Warmer Hot (already warm, destination is real heat: shade and hydration, nothing left to shed) {% endcomment %}
+{%- assign hints_warmer_hot_0_en = "It gets even hotter later. Seek shade and stay hydrated.||Real heat builds later. There is nothing left to remove, so plan for shade and water.||Temperatures climb into serious heat. Sun protection and hydration matter more than clothing now.||The heat intensifies later. Light fabrics, sunscreen, and water are your tools.||Hotter conditions develop later. Plan breaks in the shade.||Peak heat arrives later. Dress stays minimal, hydration becomes essential.||It heats up further later. Prioritize sun protection and fluids.||Even warmer later. Keep water close and avoid the midday sun." | split: "||" -%}
+{%- assign hints_warmer_hot_10_en = "It gets hotter later, and you're already out of layers to remove. Water and shade are the outfit now.||The heat gets a sequel later. Nobody asked for it. Hydrate.||Later turns hotter. Your wardrobe has done all it can. The rest is up to shade and fluids.||More heat incoming. You cannot undress your way out of this one. Drink water.||The sun turns it up later like a neighbor with new speakers. Shade and water, that's the plan.||Hotter later. Clothing has left the chat. Sunscreen and hydration remain.||The temperature climbs past reasonable later. Find shade, carry water, accept sweat.||Even hotter later. At this point your outfit is a formality. Hydrate like it's your job." | split: "||" -%}
+{%- assign hints_warmer_hot_11_en = "The heat escalates later and there is no fabric left to sacrifice. Hydrate or evaporate.||Later the sun stops playing. You cannot undress below the legal minimum, so drink water and suffer gracefully.||Peak inferno arrives later. Your outfit is irrelevant now. Shade is survival, water is currency.||It gets hotter later, as if that were necessary. Clothing cannot save you. Fluids might.||The atmosphere becomes an oven with opinions. Stay in the shade or become the roast.||More heat later. The dress code is despair and sunscreen. Hydrate relentlessly.||The sun commits fully later. There are no more layers to lose, only dignity. Drink water.||Later reaches temperatures that qualify as commentary. Shade, water, and acceptance." | split: "||" -%}
+
+{%- assign hints_warmer_hot_0_de = "Es wird später noch heißer. Such Schatten und trink genug.||Richtige Hitze baut sich auf. Ausziehen geht nicht mehr, also plane Schatten und Wasser ein.||Die Temperaturen steigen in ernsthafte Hitze. Sonnenschutz und Flüssigkeit sind jetzt wichtiger als Kleidung.||Die Hitze verstärkt sich später. Leichte Stoffe, Sonnencreme und Wasser sind deine Werkzeuge.||Später wird es noch wärmer. Halte Wasser bereit und meide die Mittagssonne.||Heißere Bedingungen später. Plane Pausen im Schatten ein.||Die Spitzenhitze kommt später. Das Outfit bleibt minimal, Trinken wird Pflicht." | split: "||" -%}
+{%- assign hints_warmer_hot_10_de = "Es wird später noch heißer, und du hast keine Schichten mehr zum Ausziehen. Wasser und Schatten sind jetzt das Outfit.||Die Hitze bekommt später eine Fortsetzung. Keiner hat danach gefragt. Trink was.||Mehr Hitze im Anmarsch. Da hilft kein Ausziehen mehr. Trink Wasser.||Die Sonne dreht später auf wie ein Nachbar mit neuen Boxen. Schatten und Wasser, das ist der Plan.||Später wird es heißer. Deine Garderobe hat alles gegeben. Der Rest ist Schatten und Flüssigkeit.||Noch heißer später. Dein Outfit ist ab jetzt Formsache. Trink, als wäre es dein Job.||Die Temperatur klettert später ins Unvernünftige. Schatten suchen, Wasser tragen, Schwitzen akzeptieren." | split: "||" -%}
+{%- assign hints_warmer_hot_11_de = "Die Hitze eskaliert später und es gibt keinen Stoff mehr zu opfern. Trink oder verdampfe.||Später hört die Sonne auf zu spielen. Unter das gesetzliche Minimum kannst du dich nicht ausziehen, also trink Wasser und leide würdevoll.||Das Inferno erreicht später den Höhepunkt. Dein Outfit ist jetzt egal. Schatten ist Überleben, Wasser ist Währung.||Es wird später noch heißer, als wäre das nötig gewesen. Kleidung rettet dich nicht mehr. Flüssigkeit vielleicht.||Die Atmosphäre wird zum Backofen mit Meinung. Bleib im Schatten oder werde zum Braten.||Die Sonne zieht später voll durch. Es gibt keine Schichten mehr zu verlieren, nur Würde. Trink Wasser.||Mehr Hitze später. Der Dresscode ist Verzweiflung und Sonnencreme. Trink gnadenlos." | split: "||" -%}
+
+{%- comment %} Scenario: Colder (cold destination, the classic add-real-warmth case) {% endcomment %}
+{%- assign hints_colder_0_en = "Temperatures drop later. Bring an extra warm layer.||It gets colder later. Make sure you have an extra layer ready.||Cooling down soon. Plan to add a warm layer later.||The air turns chilly later. Keep a warm layer within reach.||That outfit works now, but you will need extra insulation later.||Colder air moves in later. Keep a warm layer on hand.||It cools off later. Plan to add a layer when it happens.||Temperatures fall later. Bring something warm.||Chill builds later. Make sure you have insulation available.||Cooling later on. Your outfit will soon need extra warmth." | split: "||" -%}
+{%- assign hints_colder_10_en = "It gets cold later like office AC in July. Bring warmth, optimism does not insulate.||Pack an extra layer. Your outfit is overpromising future warmth.||Unless you're a radiator, that outfit will feel thin later on.||It gets cold later. Dress like you understand thermodynamics.||Don't be a hero. Add insulation before your teeth start chattering.||Later it turns colder. Your outfit is about to learn consequences, so bring warmth.||Temperatures drop later like your optimism during tax season. Pack a layer unless shivering is your thing.||The forecast cools down. Your outfit needs more insulation soon.||Cold sets in later. Pack insulation, not confidence.||The temperature drops later. Your current outfit will need backup.||It cools down later. Bring an extra layer so you can at least look prepared.||The air turns hostile later. Bring something warm or embrace the shivering.||The temperature nosedives later. Your current outfit is in denial." | split: "||" -%}
+{%- assign hints_colder_11_en = "The cold creeps in and never leaves. Add insulation later or start vibrating professionally.||The temperature plummets later like your crypto portfolio in a bear market. Bring an extra layer or regret everything.||Warmth becomes a distant memory later like affordable groceries. Wrap yourself in layers before nostalgia kicks in.||Glacial vibes approach. Add insulation later, because this outfit will not forgive you.||The temperature plummets soon. Put on extra warmth later, or become a statue with feelings.||Cold shows up later with intent. Add layers before you turn into a shivering landmark.||The forecast drops like credibility during an election year. Put on warmth before your jaw auditions for percussion.||Temperature falls hard later. Layer up early, because suffering is not a personality.||The day ends colder than a cancelled series cliffhanger. Armor up in time with layers you actually trust.||The temperature drops and stays dropped. Add insulation later, or spend the evening thinking about your life decisions.||The temperature drops like hope. Prepare accordingly." | split: "||" -%}
+
+{%- assign hints_colder_0_de = "Temperaturen fallen später. Nimm lieber eine extra Schicht mit.||Es kühlt später ab. Sorge für eine warme Schicht zum Überziehen.||Kälte im Anmarsch. Nimm lieber eine extra Schicht mit.||Das Wetter wird frischer. Eine extra Schicht ist später ratsam.||Später wird es kalt. Dein jetziges Outfit reicht nicht ganz.||Später sinken die Temperaturen weiter. Eine zusätzliche Schicht ist sinnvoll.||Es wird merklich kühler. Eine wärmende Schicht ist später ratsam." | split: "||" -%}
+{%- assign hints_colder_10_de = "Pack was Warmes ein, außer du stehst auf Zähneklappern.||Zittergefahr. Dein jetziges Outfit ist mutig, aber dumm.||Spiel später nicht den Helden. Nimm eine extra Schicht mit.||Später wird es kalt. Nimm Wärme mit, Optimismus isoliert nicht.||Wenn du kein Heizkörper bist, wird das jetzige Outfit später ziemlich dünn. Nimm was Warmes mit.||Spiel nicht den Helden. Pack eine Schicht drauf, bevor die Zähne anfangen zu klappern.||Später fallen die Temperaturen. Pack eine Schicht ein, außer Zittern ist dein Hobby.||Später wird es kälter. Pack eine Schicht drauf, bevor die Gänsehaut übernimmt.||Später wird es kälter. Dein aktuelles Outfit braucht dann Verstärkung.||Später kühlt es ab. Nimm eine extra Lage mit, damit du wenigstens vorbereitet aussiehst." | split: "||" -%}
+{%- assign hints_colder_11_de = "Hypothermie ist kein Hobby. Plane voraus oder zitter nach Hause.||Die Luft wird bösartig kalt. Ohne extra Schicht bist du verloren.||Eiszeit voraus. Dein jetziges Outfit ist später eine Einladung zum Erfrierungstod.||Die Kälte kommt nicht überraschend. Nur gnadenlos. Pack was Warmes ein.||Kälte übernimmt später das Kommando. Ohne Gnade.||Die Kälte schleicht sich später rein und bleibt. Zieh eine warme Schicht an, oder werde zur Eisskulptur mit Gefühlen.||Später fällt die Temperatur brutal. Nimm eine extra Schicht mit, sonst bereust du deine Lebensentscheidungen.||Später wird Wärme zur fernen Erinnerung wie bezahlbare Lebensmittel. Pack dich in Schichten, bevor dich nur noch Nostalgie wärmt.||Später geht's runter mit der Temperatur. Zieh was Warmes an, bevor dein Kiefer als Schlagzeug durchgeht." | split: "||" -%}
+
+{%- comment %} Scenario: Colder Mid (mild cooldown, destination stays comfortable: one light layer) {% endcomment %}
+{%- assign hints_colder_mid_0_en = "It cools off later, but only mildly. A light layer will do.||Temperatures dip later. Bring a light jacket, nothing heavy.||A cooler evening ahead. A thin extra layer is enough.||It gets noticeably cooler later, though not cold. Pack something light.||Mild cooling later. A light layer keeps you comfortable.||The air freshens up later. One thin layer covers it.||Cooler conditions develop later. A light jacket is all you need.||Temperatures ease down later. Keep a light layer handy." | split: "||" -%}
+{%- assign hints_colder_mid_10_en = "It cools down later, gently. A light jacket, not the winter arsenal.||The evening turns fresh, not arctic. Pack a thin layer and skip the drama.||Temperatures dip later. This calls for a light jacket, not a survival kit.||It gets cooler later in a polite way. One casual layer handles it.||A mild cooldown later. Bring a light layer, leave the parka in therapy.||The air cools off later, nothing personal. A hoodie level response is enough.||Later gets fresher. Think light jacket, not expedition gear.||Cooler later, but keep perspective. A thin layer is the whole solution." | split: "||" -%}
+{%- assign hints_colder_mid_11_en = "It cools later, mildly, almost apologetically. A light layer, nothing heroic.||The evening chills just enough to be noticed. Bring a thin layer or perform toughness, your call.||Temperatures drift down later. Not tragic, just enough to make bare arms a choice.||A gentle cooldown later. Pack one light layer and resist the urge to catastrophize.||It gets fresher later, the kind of cold that builds character but not frostbite. A thin layer suffices.||Later cools off just enough to punish overconfidence. One light layer buys peace.||The temperature slides down politely later. A thin jacket, no monologues required.||Cooler later, but barely worth the anxiety. Light layer, move on with your life." | split: "||" -%}
+
+{%- assign hints_colder_mid_0_de = "Es kühlt später ab, aber nur leicht. Eine dünne Schicht reicht.||Die Temperaturen sinken später etwas. Nimm eine leichte Jacke mit, nichts Dickes.||Ein kühlerer Abend steht bevor. Eine dünne extra Schicht genügt.||Es wird später spürbar kühler, aber nicht kalt. Pack etwas Leichtes ein.||Milde Abkühlung später. Eine leichte Schicht hält dich bequem warm.||Die Luft frischt später auf. Eine dünne Lage reicht völlig.||Kühlere Bedingungen später. Eine leichte Jacke ist alles, was du brauchst." | split: "||" -%}
+{%- assign hints_colder_mid_10_de = "Es kühlt später ab, aber sanft. Eine leichte Jacke, nicht das Winterarsenal.||Der Abend wird frisch, nicht arktisch. Pack eine dünne Schicht ein und spar dir das Drama.||Die Temperaturen sinken später. Das verlangt eine leichte Jacke, kein Überlebenspaket.||Es wird später höflich kühler. Eine lässige Schicht regelt das.||Milde Abkühlung später. Nimm was Leichtes mit, der Parka darf zu Hause bleiben.||Später wird es frischer. Denk an eine leichte Jacke, nicht an Expeditionsausrüstung.||Kühler später, aber bleib entspannt. Eine dünne Schicht ist die ganze Lösung." | split: "||" -%}
+{%- assign hints_colder_mid_11_de = "Es kühlt später ab, mild, fast entschuldigend. Eine leichte Schicht, keine Heldentaten.||Der Abend wird gerade kühl genug, um aufzufallen. Nimm eine dünne Schicht mit oder spiel den Harten, deine Wahl.||Die Temperaturen sinken später. Nicht tragisch, nur genug, um nackte Arme zur Entscheidung zu machen.||Sanfte Abkühlung später. Pack eine leichte Schicht ein und widersteh der Katastrophenstimmung.||Es wird später frischer, die Art von Kälte, die Charakter formt, aber keine Erfrierungen. Eine dünne Lage reicht.||Später kühlt es gerade genug ab, um Übermut zu bestrafen. Eine leichte Schicht kauft dir Frieden." | split: "||" -%}
+
+{%- comment %} Scenario: Colder Hot (cooling from extreme heat, destination still hot: pure relief, no layer) {% endcomment %}
+{%- assign hints_colder_hot_0_en = "It cools down later, but stays hot. No extra layer needed.||Temperatures ease later while remaining warm. Your light outfit keeps working.||The heat softens later. No need to pack anything extra.||A cooler stretch arrives later, but it stays warm enough for light clothing.||Relief comes later as temperatures drop, though it remains warm.||It gets less hot later. Keep the light outfit, skip the extra layer.||The peak heat passes later. Conditions stay warm and comfortable.||Cooler air arrives later, but nothing you need to dress for." | split: "||" -%}
+{%- assign hints_colder_hot_10_en = "It cools off later, from broiling to merely warm. No jacket required, just gratitude.||The heat backs off later. Do not pack a sweater, this is relief, not a cold front.||Temperatures drop later into what normal people call summer. Stay as you are.||Later gets cooler, meaning survivable instead of scorching. Your outfit is fine.||The oven dials down later. Still warm, no layers needed, just enjoy it.||It cools from ridiculous to reasonable later. Resist the urge to bring a jacket.||The heat takes its foot off the gas later. You still won't need sleeves.||Cooler later, in the way a sauna is cooler than a volcano. Stay light." | split: "||" -%}
+{%- assign hints_colder_hot_11_en = "The heat retreats later, defeated but not gone. No layers needed, just quiet relief.||It cools from unbearable to tolerable later. Do not confuse this with autumn, keep the shorts.||The furnace loses interest later. Still warm enough that a jacket would be satire.||Temperatures fall later, from punishment to warning. Your outfit survives unchanged.||Later brings mercy in the form of slightly less heat. Anyone carrying a sweater is showing off.||The sun eases up later like a boss leaving early. Still warm. Change nothing.||It gets cooler later, which at these temperatures means almost pleasant. Stay light and suspicious.||The heat stands down later. You remain in summer clothes. This is the good ending." | split: "||" -%}
+
+{%- assign hints_colder_hot_0_de = "Es kühlt später ab, bleibt aber heiß. Keine extra Schicht nötig.||Die Temperaturen sinken später, es bleibt aber warm. Dein leichtes Outfit funktioniert weiter.||Die Hitze lässt spÃ¤ter nach. Du musst nichts extra einpacken.||Später wird es kühler, aber es bleibt sommerlich warm.||Später kommt Abkühlung, aber nichts, wofür du dich umziehen musst.||Die größte Hitze zieht später ab. Es bleibt warm und angenehm.||Es wird spÃ¤ter weniger heiß. Bleib beim leichten Outfit, spar dir die extra Schicht." | split: "||" -%}
+{%- assign hints_colder_hot_10_de = "Es kühlt später ab, vom Backofen auf angenehm warm. Keine Jacke nötig, nur Dankbarkeit.||Die Hitze zieht sich später zurück. Pack keinen Pulli ein, das ist Erleichterung, keine Kaltfront.||Die Temperaturen fallen später auf das, was normale Menschen Sommer nennen. Bleib wie du bist.||Der Ofen wird später runtergedreht. Immer noch warm, keine Schichten nötig, einfach genießen.||Es kühlt von absurd auf vernünftig ab. Widersteh dem Drang, eine Jacke mitzunehmen.||Die Hitze nimmt später den Fuß vom Gas. Ärmel brauchst du trotzdem keine.||Kühler später, so wie eine Sauna kühler ist als ein Vulkan. Bleib leicht angezogen." | split: "||" -%}
+{%- assign hints_colder_hot_11_de = "Die Hitze zieht sich später zurück, geschlagen, aber nicht weg. Keine Schichten nötig, nur stille Erleichterung.||Es kühlt von unerträglich auf erträglich ab. Verwechsle das nicht mit Herbst, die Shorts bleiben.||Der Hochofen verliert später das Interesse. Immer noch warm genug, dass eine Jacke Satire wäre.||Die Temperaturen fallen später, von Strafe zu Verwarnung. Dein Outfit übersteht das unverändert.||Später kommt Gnade in Form von etwas weniger Hitze. Wer einen Pulli mitnimmt, will nur angeben.||Die Sonne macht später Feierabend, früher als dein Chef. Es bleibt warm. Ändere nichts.||Die Hitze tritt später ab. Du bleibst in Sommerkleidung. Das ist das gute Ende." | split: "||" -%}
+
+{%- comment %} Scenario: Arc (warms up first, cools down again later: layers off, then back on) {% endcomment %}
+{%- assign hints_arc_0_en = "It warms up first, then cools down again later. Wear layers you can remove and put back on.||Temperatures rise before falling again toward evening. Flexible layers cover both.||A warm middle of the day, cooler again later. Keep any layers you shed with you.||It gets warmer, then colder again by evening. Removable layers you can carry are ideal.||Warm peak ahead, cooler finish. Dress in layers and hold on to them.||Up first, down later. One adjustable outfit handles the whole day.||The day warms up and cools off again. Plan to take layers off and put them back on." | split: "||" -%}
+{%- assign hints_arc_10_en = "The day does a full arc: it warms up, peaks, and cools back down. Your layers come off and go back on, so keep them close.||Warm later, cold after that. Whatever you take off at noon, you will want back by evening. Plan custody accordingly.||The temperature goes up, then changes its mind. Shed layers, but do not abandon them anywhere.||Classic day shape: heat in the middle, chill at both ends. Layers are a subscription today, not a single purchase.||It warms up, then takes it all back by evening. Your jacket is off duty, not fired.||Peak warmth around midday, refund in the evening. Keep the receipts, meaning your layers.||The forecast is a round trip: warmer out, colder back. Pack layers for both directions." | split: "||" -%}
+{%- assign hints_arc_11_en = "The day rehearses all four seasons. Carry layers like a sherpa or suffer twice, once sweating, once shivering.||Warmth arrives, peaks, and abandons you by evening. Keep every layer within reach, trust nothing.||The temperature climbs just to make the evening drop hurt more. Shed layers, guard them, redeploy at dusk.||A brief warm illusion, then the cold returns to collect. Layers off at noon, layers on at dusk, no complaints accepted.||The day promises summer and issues a refund by evening. Carry your layers everywhere like emotional baggage.||Warm middle, cold ending, like most careers. Keep your layers on standby all day.||The forecast is a betrayal in two acts. Act one: sweat. Act two: shiver. Costume changes required." | split: "||" -%}
+
+{%- assign hints_arc_0_de = "Es wird erst wärmer, später wieder kühler. Trag Schichten, die du ablegen und wieder anziehen kannst.||Die Temperaturen steigen zunächst und fallen zum Abend wieder. Flexible Schichten decken beides ab.||Warme Tagesmitte, kühlerer Abend. Behalte abgelegte Schichten bei dir.||Es wird wärmer und gegen Abend wieder kälter. Ablegbare Schichten zum Mitnehmen sind ideal.||Erst rauf, dann runter. Ein anpassbares Outfit reicht für den ganzen Tag.||Der Tag wärmt sich auf und kühlt wieder ab. Plane ein, Schichten abzulegen und später wieder anzuziehen." | split: "||" -%}
+{%- assign hints_arc_10_de = "Der Tag macht den vollen Bogen: aufwärmen, Höhepunkt, abkühlen. Deine Schichten gehen aus und wieder an, also behalte sie in der Nähe.||Erst warm, dann wieder kalt. Was du mittags ausziehst, willst du abends zurück. Plane das Sorgerecht entsprechend.||Die Temperatur steigt und überlegt es sich dann anders. Leg Schichten ab, aber lass sie nirgendwo liegen.||Klassischer Tagesverlauf: Hitze in der Mitte, Frische an beiden Enden. Schichten sind heute ein Abo, kein Einmalkauf.||Es wird warm und abends wird alles zurückgenommen. Deine Jacke hat Pause, ist aber nicht gekündigt.||Die Prognose ist eine Rundreise: wärmer hin, kälter zurück. Pack Schichten für beide Richtungen ein." | split: "||" -%}
+{%- assign hints_arc_11_de = "Der Tag probt alle vier Jahreszeiten. Schlepp Schichten wie ein Sherpa oder leide doppelt, einmal schwitzend, einmal zitternd.||Die Wärme kommt, glänzt kurz und lässt dich am Abend fallen. Behalte jede Schicht griffbereit, trau dem Frieden nicht.||Die Temperatur steigt nur, damit der Absturz am Abend mehr wehtut. Schichten ablegen, bewachen, abends wieder anlegen.||Eine kurze warme Illusion, dann kommt die Kälte zum Kassieren. Mittags Schichten aus, abends Schichten an, Beschwerden zwecklos.||Der Tag verspricht Sommer und liefert abends die Rückerstattung. Trag deine Schichten überall mit hin wie emotionalen Ballast.||Warme Mitte, kaltes Ende, wie die meisten Karrieren. Halte deine Schichten den ganzen Tag in Bereitschaft.||Die Prognose ist ein Verrat in zwei Akten. Erster Akt: schwitzen. Zweiter Akt: zittern. Kostümwechsel erforderlich." | split: "||" -%}
+
+{%- comment %} Scenario: Wetter {% endcomment %}
+{%- assign hints_wetter_0_en = "Rain moves in later. Bring a waterproof layer.||Precipitation ahead. Bring a rain jacket or umbrella.||Showers are expected later. Keep an umbrella or rain shell handy.||It turns wet later. Bring something that blocks rain.||Rain incoming. Make sure your outer layer sheds water.||It will get wet later. Bring an umbrella or a rain shell.||Showers may develop later. Keep waterproof protection ready.||Wet weather arrives later. Plan for a waterproof layer.||Rain is likely later. Bring an umbrella or a rain jacket.||Wet weather arrives later. Keep rain gear within reach.||Wet conditions later. A shell or umbrella will help." | split: "||" -%}
+{%- assign hints_wetter_10_en = "The sky will leak later like a cheap apartment ceiling. Cover up or accept damp consequences.||Nice outfit. It would be a shame if it got soaked later. Bring an umbrella.||Rain shows up later. Your outfit won't enjoy it.||Water is coming. A hood is the minimum requirement for dignity.||Rain shows up later. You can ignore it, but your outfit won't forgive you.||Later the sky starts dripping. Bring cover or embrace the damage.||Rain shows up later. Protect the outfit or learn a lesson.||Wet conditions later. Bring a waterproof layer if you want to stay presentable.||Showers later. Keep a shell ready unless you like damp drama.||Water moves in. Bring an umbrella before your outfit quits.||Rain later. A waterproof layer is cheaper than regret.||Rain moves in later. Protection now prevents unnecessary suffering.||Is the rain local? Artisanal? Free-range? Doesn't matter. It's coming. Bring an umbrella.||Rain targets you specifically. Defense is recommended." | split: "||" -%}
+{%- assign hints_wetter_11_en = "The clouds arm themselves for combat. Bring a shield later or accept the soaking as character development.||Aquatic misery approaches. Wear waterproof gear later or slowly dissolve in public.||The sky targets your outfit personally. Rain later. Bring an umbrella or accept your fate as a drowned rat.||The forecast turns hostile and wet. Cover up later or embrace your new life as a damp object.||Nature pulls the flush eventually. Wear a raincoat later if you enjoy remaining human-shaped.||Rain builds with intent. Shield up later or get flattened into wet fabric.||The forecast turns hostile and wet. Wear a shell later or become a cautionary puddle.||Water arrives later like a verdict. Cover up with an umbrella or accept the sentence.||The sky opens later with zero mercy. Bring waterproof armor or become a warning to others.||The forecast turns aquatic and hostile. Defend yourself now or drown in regret later." | split: "||" -%}
+
+{%- assign hints_wetter_0_de = "Es regnet später vermutlich. Pack einen Schirm oder eine Regenjacke ein.||Es wird später nass. Achte auf eine wasserdichte Schicht.||Niederschlag erwartet. Dein Outfit braucht einen Regenschutz.||Schauer ziehen auf. Bring dich und deine Kleidung später in Sicherheit.||Das Wetter schlägt später um. Halte Regensachen griffbereit.||Später ist mit Regen zu rechnen. Ein Regenschutz ist empfehlenswert.||Nasse Phasen im Tagesverlauf möglich. Pack einen Schirm oder eine Regenjacke ein." | split: "||" -%}
+{%- assign hints_wetter_10_de = "Der Himmel wird später undicht. Nimm einen Schirm mit oder sieh aus wie ein begossener Pudel.||Wildlederschuhe sind heute eine ganz dumme Idee. Es wird später nass.||Später kommt eine Gratis-Dusche von oben. Deine Frisur wird es hassen.||Regenalarm. Eine Kapuze ist später das Minimum an Würde.||Später regnet es. Du kannst es ignorieren, aber dein Outfit wird es dir nicht verzeihen.||Ein Friesennerz ist spÃ¤ter kein modisches Statement, sondern Notwendigkeit.||Nettes Outfit. Wäre schade, wenn es spÃ¤ter komplett durchnässt. Pack einen Schirm ein.||Später kommt der Regen. Schütz das Outfit mit Regenjacke oder Schirm, oder lern aus deinen Fehlern.||Später wird es nass. Nimm eine wasserdichte Schicht mit, wenn du halbwegs vorzeigbar bleiben willst.||Später zieht Regen auf. Eine Regenjacke spart dir unnötiges Leid.||Später kommt Regen. Des isch koi Witz. Nimm an Schirm mit oder lauf rum wie a begossener Pudel." | split: "||" -%}
+{%- assign hints_wetter_11_de = "Die Wolken rüsten auf für den Kampf. Nimm einen Schirm oder akzeptiere die Durchnässung als Charakterbildung.||Feuchtes Elend voraus. Nimm Regenschutz oder löse dich langsam in der Öffentlichkeit auf.||Die Natur drückt später die Spülung. Sei bereit.||Der Himmel nimmt dein Outfit später persönlich. Nimm einen Schirm oder akzeptiere dein Schicksal als nasse Ratte.||Später wird es feindselig und nass. Schütz dich mit Schirm oder Regenjacke, oder lebe als feuchtes Etwas weiter.||Später wird es nass und unangenehm. Nimm eine Regenjacke mit, oder du wirst zur warnenden Pfütze.||Der Regen kommt später mit Nachdruck. Nimm einen Schirm, oder werde zur Warnung für andere." | split: "||" -%}
+
+{%- comment %} Scenario: Drier {% endcomment %}
+{%- assign hints_drier_0_en = "Rain clears later. You can remove the waterproofs soon.||Drying out ahead. That umbrella will not be needed for long.||Showers end later. Plan to remove the rain gear.||Weather improves with time. Switch to dry layers when it does.||The rain stops later. Your waterproof layer becomes optional.||It dries out later. You can stow the rain layer soon.||Wet weather fades soon. Plan to remove waterproof gear.||Conditions improve later. Drop rain protection when it clears.||Showers taper off later. Your shell becomes optional.||Dry weather returns later. Lighten up when it does.||Showers clear later. Plan to remove your rain protection." | split: "||" -%}
+{%- assign hints_drier_10_en = "The rain rage-quits later like a gamer on a losing streak. Stop dressing like a fisherman when it does.||Rain quits later. Your umbrella transforms into an awkward stick you'll carry around for no reason.||Rain stopping later. Peel off the waterproof layer before it looks weird.||Retire the shell later. Your outfit can finally breathe.||Dryness returns soon. End the deep-sea diver cosplay.||The sky calms down later. You can stop dressing like rain is a lifestyle.||Rain ends soon. Your umbrella becomes a useless prop you'll awkwardly carry home.||It clears later. Remove the shell before it becomes your personality.||Dry conditions return later. Let your outfit breathe for once and drop the rain layer.||The showers leave soon. Retire the waterproof layer later and act normal again.||The wetness admits defeat. Retire your rain gear with honor." | split: "||" -%}
+{%- assign hints_drier_11_en = "The deluge ends soon. Your raincoat becomes a wet, pointless burden you'll carry home like regret.||Water torture finishes soon. Remove the waterproof shell and rejoin breathable reality when it does.||The sky empties out. That raincoat becomes dead weight, so drop it when it clears.||The clouds run out of ammo. Lower your shields later and stop wearing waterproof armor.||Dry weather returns. Shed your waterproof skin later like rain never happened.||The rain stops later. Drop the armor and rejoin normal life, if you remember how.||Water retreats. Your rain shell turns into useless wet baggage soon.||The sky runs dry soon. Peel off the waterproof layer later before you start squeaking.||The storm exhausts itself soon. Abandon the shell later and let air touch you again.||Dryness returns soon. Remove the rain layer when it does, because you are not a submarine.||Rain evacuates like credibility from a scandal. Shed the armor and move forward." | split: "||" -%}
+
+{%- assign hints_drier_0_de = "Der Regen hört bald auf. Du kannst die Regensachen später wegpacken.||Es wird trockener. Der Schirm wird bald überflüssig.||Wetterbesserung in Sicht. Die Regenjacke kannst du später offen tragen.||Schauer werden bald enden. Du kannst die Regensachen später wegpacken.||Kein Regen später. Der Schirm wird später optional.||Es wird zunehmend trocken. Du kannst die Regensachen später wegpacken." | split: "||" -%}
+{%- assign hints_drier_10_de = "Der Regen gibt auf. Du kannst aufhören, wie ein Nordseefischer auszusehen.||Später hört der Regen auf. Dein Schirm wird zum nutzlosen Requisit, das du peinlich rumträgst.||Trockenheit kehrt später zurück. Dein U-Boot-Outfit ist bald übertrieben.||Der Regen zieht bald ab. Schäl dich aus der Plastikpelle, bevor es komisch aussieht.||Trockenheit kehrt zurück. Schäl dich aus der Regenhülle, bevor es verzweifelt aussieht.||Später klart es auf. Leg die Regenjacke ab, bevor sie zu deiner Persönlichkeit wird.||Trockenheit kehrt zurück. Beende das Tiefseetaucher-Cosplay." | split: "||" -%}
+{%- assign hints_drier_11_de = "Die Sintflut endet. Dein Regenmantel wird zur nassen, unnützen Erinnerung an schlechte Entscheidungen.||Waterboarding ist bald vorbei. Befrei dich später aus der Plastikhülle und atme durch.||Die Kübel sind bald leer. Deine Regenjacke ist bald nur noch Ballast.||Bald haben die Wolken keine Munition mehr. Senk später die Schilde und leg die wasserdichte Rüstung ab.||Bald wird es wieder trocken. Leg später die Regenhaut ab, als wäre nie etwas passiert.||Später hört der Regen auf. Leg die Rüstung ab und kehr ins normale Leben zurück, wenn du dich daran noch erinnerst.||Bald zieht sich der Regen zurück. Dann wird die Regenjacke zu nutzlosem, nassem Gepäck.||Es wird bald trocken. Schäl dich aus dem Friesennerz, bevor du anfängst zu quietschen." | split: "||" -%}
+
+{%- comment %} Scenario: Wetter & Warmer {% endcomment %}
+{%- assign hints_wetter_warmer_0_en = "Rain and heat arrive together later. Bring breathable rain protection.||Warm showers ahead. Pack a light shell or an umbrella.||It turns humid and wet soon. Avoid heavy rain gear later.||Tropical conditions develop later. Keep waterproofs light.||Wet but warm later. Dress lightly under your rain shell.||Warm rain develops later. Pack a breathable shell.||Humid and wet later. Keep rain protection light and airy.||Warm and wet later. Pack a light rain layer.||Warm showers later. Bring light rain gear." | split: "||" -%}
+{%- assign hints_wetter_warmer_10_en = "Steam room energy later. Heavy waterproofs will betray you.||Warm rain starting later. You will need a light shell, not a sauna suit.||Warm rain later. Do not turn your outfit into a boil-in-the-bag situation.||Warm rain arrives soon. The goal is dry, not cooked.||Sweat and rain team up later like a buddy cop movie. Bring breathable gear.||It gets warm and wet later. Bring a shell, not a portable greenhouse.||Warm rain later. Stay dry without turning into steamed laundry.||Humid showers ahead. Wear breathable gear or simmer quietly.||Warm and wet incoming. Choose a light shell unless you enjoy sweating." | split: "||" -%}
+{%- assign hints_wetter_warmer_11_en = "Welcome to the swamp phase. Wear breathable rain gear later or steam yourself into silence.||The air thickens into soup. Dress lightly later and use a breathable shell, unless you want to be the garnish.||Moist heat builds. Bring light, breathable rain protection later or let nature cultivate moss on you.||Suffocating dampness later. Heavy layers become a slow-cooking death sentence.||Warm rain starting later. Choose breathable rain protection, unless you enjoy being steamed like a dumpling.||Warm rain later. Wear breathable protection or become part of the humidity exhibit.||Heat and rain combine later. Pick a shell that breathes, or you will not.||The atmosphere thickens into hostility. Light waterproofs or become the broth." | split: "||" -%}
+
+{%- assign hints_wetter_warmer_0_de = "Es wird wärmer, aber nass. Nimm eine leichte, atmungsaktive Regenjacke.||Schwüles Wetter voraus. Bloß keine dicke Winterjacke als Regenschutz.||Tropische Verhältnisse voraus. Dein Regenschutz muss atmen können.||Es wird nass, aber warm. Vermeide Hitzestau unter der Regenjacke.||Warmes, feuchtes Wetter setzt sich durch. Atmungsaktive Kleidung wird wichtig." | split: "||" -%}
+{%- assign hints_wetter_warmer_10_de = "Tropenhausfeeling im Anmarsch. Wer später eine dicke Jacke trägt, verliert.||Warmer Regen voraus. Das Ziel ist trocken bleiben, nicht Sous-Vide-Garen.||Später schwitzt du entweder von innen oder von außen. Nimm eine atmungsaktive Regenschicht mit.||Wer jetzt falsch plant, gart sich selbst. Such lieber schon mal eine atmungsaktive Regenjacke.||Regen und Wärme verbünden sich später gegen dich. Nimm atmungsaktiven Regenschutz.||Später wird es warm und nass. Nimm eine dünne Regenjacke, kein tragbares Gewächshaus.||Später kommen schwüle Schauer. Trag atmungsaktive Lagen, oder köchel leise vor dich hin.||Später wird es warm und nass. Nimm eine leichte Hülle, außer du schwitzt gerne." | split: "||" -%}
+{%- assign hints_wetter_warmer_11_de = "Willkommen in der Sumpfphase. Trag später atmungsaktiven Regenschutz oder dünste dich selbst stumm.||Die Natur versucht später, Moos auf dir zu züchten. Nimm leichten, atmungsaktiven Regenschutz.||Du bist bald der Knödel im Dampfgarer. Viel Glück trocken zu bleiben.||Später wird die Luft zur Suppe. Zieh dich leicht an und nimm eine atmungsaktive Regenhülle, sonst bist du die Einlage.||Später wird es erstickend feucht. Schwere Schichten werden zum langsamen Todesurteil.||Später kommt warmer Regen. Nimm eine atmungsaktive Regenschicht, außer du willst gedünstet werden wie ein Maultäschle.||Feuchte Hitze baut sich auf. Nimm leichten, atmungsaktiven Regenschutz mit, oder lass die Natur Moos auf dir züchten." | split: "||" -%}
+
+{%- comment %} Scenario: Wetter & Colder {% endcomment %}
+{%- assign hints_wetter_colder_0_en = "Cold rain arrives later. Bring warmth and waterproof protection.||Chilly and wet conditions ahead. Pack insulation and rain protection.||Rough weather builds. Reinforce your outfit against cold and wet.||Colder air and rain develop. Bring insulation plus waterproof coverage.||Wet conditions turn colder later. Pack insulation and a rain layer.||Rain moves in as temperatures fall. Bring something to keep warm and stay dry.||Cold showers later. Pack warmth with solid water protection.||Damp and chilly later. Bring protection for both cold and rain.||Cold rain later. Bring warm, waterproof layers.||Wet and cold conditions ahead. Pack for both." | split: "||" -%}
+{%- assign hints_wetter_colder_10_en = "Cold mud season approaches. Start building a waterproof fortress.||Wet and cold incoming. Dress like a hardened fisherman.||Freezing rain shows up later. Dressing light will hurt.||Grim weather ahead. Warmth plus waterproofs equals survival.||Later it turns cold and wet. Build the outfit like a bunker with sleeves.||Wet and cold incoming. Armor up before you start complaining.||Cold rain later. Bring insulation and waterproofs, not confidence." | split: "||" -%}
+{%- assign hints_wetter_colder_11_en = "Nature gears up to break you later like an overzealous personal trainer. Bring warm layers and waterproofs, unless you enjoy being miserable.||Bone-chilling dampness creeps in later. Layer up or shiver like a wet dishrag.||The sky spits ice eventually. Defend yourself later with insulation and waterproof armor.||Cold and wet unite soon like the worst team-up. Armor up later with warmth and waterproofs before regret sets in.||Later it turns cold and wet. Layer up, or become a shivering sponge with broken dreams.||Cold rain later. Armor up with real insulation and waterproof layers, or get punished slowly.||The forecast becomes a test of will. Layer every defense or fail publicly." | split: "||" -%}
+
+{%- assign hints_wetter_colder_0_de = "Es wird nasskalt. Du brauchst Wärme und Regenschutz gleichzeitig.||Ekelwetter voraus. Isolation und Regenschutz werden Pflicht.||Temperatursturz und Regen im Anmarsch. Priorisiere warme, wasserdichte Kleidung.||Es wird kühl und nass. Pack dich später gut ein.||Es wird ungemütlich. Dein Outfit muss später gegen Kälte und Nässe helfen." | split: "||" -%}
+{%- assign hints_wetter_colder_10_de = "Das Wetter hat später schlechte Laune. Bau dir eine wasserdichte Festung.||Später wird es kalt und nass. Zieh dich an wie für eine Polarexpedition.||Eisregen im Anmarsch. Wer sich dünn anzieht, hat das Leben nicht verstanden.||Bald wird das Wetter einfach grundlos gemein. Versuch später warm und trocken zu bleiben.||Später wird es nasskalt wie ein Hafengeburtstag im Herbst. Zieh dich an wie für eine Polarexpedition.||Nass und kalt im Anmarsch. Zieh dich an wie ein abgehärteter Seemann." | split: "||" -%}
+{%- assign hints_wetter_colder_11_de = "Die Natur will dich später brechen wie ein übermotivierter Fitnesstrainer. Du brauchst alles, was warm und trocken hält.||Knochenkalte Nässe war gestern, jetzt kommt der nasse Tod. Versuche später warm und trocken zu bleiben.||Es regnet später Eiswürfel. Verteidige dich.||Der Himmel hat beschlossen, dich zu testen. Versuche später warm und trocken zu bleiben.||Es wird später nasskalt wie nach einem Torpedotreffer. Verteidige dich mit Wärme und Regenschutz.||Es wird später kalt und nass. Bau dir ein Outfit wie einen Bunker mit Ärmeln.||Kälte und Nässe verbünden sich wie das schlechteste Team-up. Rüste dich mit Wärme und Wasserschutz, bevor du es bereust." | split: "||" -%}
+
+{%- comment %} Scenario: Drier & Warmer {% endcomment %}
+{%- assign hints_drier_warmer_0_en = "Clearing and warming ahead. Plan to remove heavy layers later.||Rain stops and heat rises soon. Plan to shed layers over time.||Weather improves later. Your outfit should get lighter as things progress.||Sun breaks through later. Drop rain gear and warmth when it does.||It clears and warms later. Plan to remove rain gear and lighten up.||Sun returns with warmth soon. Shed heavy pieces as conditions improve.||Clearing skies bring warmer conditions later. Adjust your outfit accordingly when it does.||Later it gets drier and warmer. Drop extra layers when it does.||Better weather later. Keep your outfit ready to get lighter." | split: "||" -%}
+{%- assign hints_drier_warmer_10_en = "The weather apologizes later. Ditch the gear and move on.||From wet to sweat. Have an exit strategy for your layers.||The sun returns to the scene soon. Strip off the waterproof layer when it does.||Later it clears and warms. Do not be the weirdo in a raincoat once it dries up.||Later it clears and warms. Retire the shell before it looks desperate.||Rain ends and heat starts soon. Remove layers like you planned this.||Sunshine later. Stop wearing waterproofs like it is a lifestyle choice.||It turns nicer soon. Lose the waterproof layer before you start sweating about it." | split: "||" -%}
+{%- assign hints_drier_warmer_11_en = "The sky stops crying and starts burning soon. Drop the rain gear or steam quietly when it does.||Chaos winds down. Shed the survival gear later or sweat pointlessly.||The weather flips like a politician's promises. Sun later. Ditch the raincoat before you marinate in your own sweat.||Later it clears and heats up. Remove rain gear and extra warmth in time, or cook in your own planning.||The day flips to bright heat. Abandon the shell later and go lighter, unless you like sweating for no reason.||Weather pivots hard like a campaign promise. Strip down later and ditch waterproofs, because the new regime is heat.||The sky pivots without warning. Lighten up or become a sweaty monument to over-preparation." | split: "||" -%}
+
+{%- assign hints_drier_warmer_0_de = "Es klart auf und wird wärmer. Du kannst später Schichten ablegen.||Regen stoppt, Sonne kommt. Mach dich bereit, bald Schichten auszuziehen.||Wetterbesserung in Sicht. Dein Outfit sollte flexibel und leichter werden.||Trockener und wärmer voraus. Bald können die Regensachen weg.||Es wird schön. Plane später einen Outfitwechsel ein.||Es wird später freundlicher und wärmer. Dein Outfit kann dann leichter werden.||Die Sonne setzt sich später durch. Mach dich bereit die Regenkleidung auszuziehen.||Das Wetter verbessert sich bald spürbar. Mach dich bereit Schichten abzulegen." | split: "||" -%}
+{%- assign hints_drier_warmer_10_de = "Das Wetter entschuldigt sich bald. Weg mit dem Plastik, hallo Sonne.||Die Sonne kehrt zum Tatort zurück. Schäl dich bald mal aus den Schichten.||Wetterupgrade voraus. Tausch bald die Kapuze gegen eine Sonnenbrille.||Sonne meldet sich später zurück wie Peter Lustig nach der Werbepause. Regenschutz wird dann peinlich.||Es klart auf und wird warm. Sei nicht der Spinner in der Regenjacke, wenn es trocken ist.||Es klart auf und wird warm. Leg die Hülle ab, bevor es verzweifelt aussieht." | split: "||" -%}
+{%- assign hints_drier_warmer_11_de = "Der Himmel hört bald auf zu heulen und fängt an zu brennen. Wirf den Regenschutz ab oder dünste still vor dich hin.||Das Chaos endet bald. Wirf dann die Überlebensausrüstung weg oder schwitze sinnlos.||Das Wetter schwenkt hart um wie ein Wahlversprechen. Leg die Regenklamotten ab oder mariniere in deinem eigenen Schweiß.||Das Wetter schwenkt hart um wie ein Politiker im Wahlkampf. Leg die Überlebensausrüstung ab oder schwitze sinnlos." | split: "||" -%}
+
+{%- comment %} Scenario: Drier & Colder {% endcomment %}
+{%- assign hints_drier_colder_0_en = "Rain ends later, then temperatures drop. Swap waterproofs for warmth when it does.||Conditions dry out while temperatures fall. Keep a warm layer ready.||Clear and crisp ahead. Lose the waterproofs, keep the warmth when it does.||Dry and cold later. Bring an extra layer for when the rain ends.||The rain tapers off, then it cools down later. Replace waterproofs with warmth when it does.||Drier air arrives with colder temps soon. Keep insulation ready.||Skies clear but temperatures fall. Keep a warm layer ready for after the rain.||Rain ends later. Bring a warm layer for the cooler stretch.||It turns dry but colder soon. Plan for warmth once waterproofs are not needed." | split: "||" -%}
+{%- assign hints_drier_colder_10_en = "Water leaves and the cold takes over. Swap plastic for wool.||Dry freeze ahead. Ditch the shell and grab insulation once it does.||Later it dries out and cools off. Swap rain defense for warmth.||Dry and colder later. Your umbrella retires, your warm layers get promoted." | split: "||" -%}
+{%- assign hints_drier_colder_11_en = "No more rain, just raw cold later. Pack warmth now, because your future self will complain.||The forecast turns crisp and mean. Dress warm later, because the wind does not care about your outfit.||Dry and cold later. Put on real warmth once the rain ends, or become a frozen monument.||No more rain later. Just cold air and the realization that comfort is not coming back.||The wet phase ends. The cold phase continues. Adjust your expectations and your layers once it does.||Rain exits, cold settles permanently. Your outfit faces a regime change." | split: "||" -%}
+
+{%- assign hints_drier_colder_0_de = "Regen endet bald, aber es kühlt ab. Tausch die Regenjacke bald gegen was wärmeres.||Es wird später trocken, aber kalt. Halte eine warme Schicht bereit.||Niederschlag stoppt bald, aber die Temperatur fällt. Halte eine warme Schicht bereit.||Es wird später knackig kalt. Zieh dich warm an, sobald der Regen durch ist.||Der Regen zieht ab, aber es bleibt kalt. Halte eine warme Schicht bereit.||Trockene, kalte Luft setzt sich später durch. Halte eine warme Schicht bereit.||Es wird später trocken, aber unangenehm kühl. Halte eine warme Schicht bereit." | split: "||" -%}
+{%- assign hints_drier_colder_10_de = "Es regnet bald nicht mehr, aber dann frierst du. Tausch später Schirm gegen Schal.||Du wirst später nicht mehr nass, aber zitterst. Nimm was Warmes mit.||Trockene Kälte voraus. Weg mit der Plastikhülle, her mit dem Mantel.||Später ist es nicht mehr nass, sondern nur noch arschkalt. Pack dich also bald ein." | split: "||" -%}
+{%- assign hints_drier_colder_11_de = "Der Regen ist bald weg, dann kommt aber die Kälte. Mach dich bereit.||Es wird frisch, nein, eiskalt! Du wurdest gewarnt.||Bald wird es trocken und eisig wie die Stimmung bei der Tagesschau. Zieh was Warmes an oder frier still.||Kein Regen mehr, nur rohe Kälte. Pack jetzt Wärme ein, denn dein zukünftiges Ich wird sich beschweren." | split: "||" -%}
+
+{%- comment %} Peruvian Spanish library {% endcomment %}
+{%- assign hints_perfect_0_es = "El clima se mantiene estable. Estás listo para el resto del día.||El pronóstico sigue igual. No necesitas cambiarte más tarde.||Todo seguirá igual, así que este outfit te sirve por el resto del día." | split: "||" -%}
+{%- assign hints_perfect_10_es = "El clima está en piloto automático. No le des tantas vueltas a tu outfit.||Pronóstico aburrido: tu ropa puede seguir sin drama.||La Madre Naturaleza está floja hoy. Quédate con lo que llevas." | split: "||" -%}
+{%- assign hints_perfect_11_es = "Se viene una monotonía implacable. Estás condenado a este outfit hasta la noche.||El cielo se rindió. Acepta tu destino sartorial y no toques esas capas.||Nada cambiará. Ni el clima ni tu ropa. Quédate así y sobrevive al aburrimiento." | split: "||" -%}
+{%- assign hints_warmer_0_es = "Más tarde subirá la temperatura. Usa capas que puedas quitarte fácilmente.||Se pondrá más cálido. Evita las capas gruesas que no puedas sacarte.||El calor aumentará poco a poco. Planea quitarte una capa más tarde." | split: "||" -%}
+{%- assign hints_warmer_10_es = "Más tarde hará calor como en el Metropolitano lleno. Usa capas fáciles de sacar.||Lo que llevas puesto te hará sudar después. Vístete por capas removibles.||No te encariñes con esas capas: en la tarde vas a querer sacártelas." | split: "||" -%}
+{%- assign hints_warmer_11_es = "El sol afila los cuchillos para más tarde. Quítate capas a tiempo o ásate con dignidad.||Se viene calor atrasado. Usa capas removibles o marínate en tu propio arrepentimiento.||Tu outfit te traicionará después. Déjale una ruta de escape." | split: "||" -%}
+{%- assign hints_warmer_cold_0_es = "Más tarde estará un poco menos frío, pero seguirá haciendo frío. Mantén las capas abrigadoras.||Subirá un poco la temperatura, pero no necesitas cambiarte.||Llegará una leve mejora, pero todavía necesitas ropa de invierno." | split: "||" -%}
+{%- assign hints_warmer_cold_10_es = "Más tarde pasaremos de congeladora a refri. El abrigo se queda puesto.||Técnicamente hará más calor; en la práctica, sigue siendo clima de abrigo.||Buena noticia: menos frío. Mala noticia: todavía hace frío. Déjate todo puesto." | split: "||" -%}
+{%- assign hints_warmer_cold_11_es = "Sube de brutal a apenas hostil. Mantén todas las capas: la esperanza no abriga.||Unos grados de misericordia, pero todavía con frío para arrepentirse de todo.||El pronóstico promete mejora y entrega migajas. Conserva el abrigo y no confíes." | split: "||" -%}
+{%- assign hints_warmer_hot_0_es = "Más tarde hará todavía más calor. Busca sombra y mantente hidratado.||El calor aumentará bastante. Ya no hay mucho que quitarse: prioriza sombra y agua.||La temperatura subirá fuerte. Usa ropa ligera, bloqueador y toma agua." | split: "||" -%}
+{%- assign hints_warmer_hot_10_es = "Más calor después y ya no te quedan capas por quitar. Ahora el outfit es agua y sombra.||El calor tendrá secuela. Nadie la pidió. Hidrátate.||Tu clóset ya dio todo lo que podía. Busca sombra y lleva agua." | split: "||" -%}
+{%- assign hints_warmer_hot_11_es = "El calor escala y ya no queda tela que sacrificar. Hidrátate o evapórate.||El infierno llega a su máximo. Tu outfit ya es irrelevante: sombra para sobrevivir, agua como moneda.||El ambiente se vuelve un horno con opiniones. Quédate en la sombra o conviértete en anticucho." | split: "||" -%}
+{%- assign hints_colder_0_es = "Más tarde bajará la temperatura. Ten una capa abrigadora lista.||Se viene más frío. Agrega una capa que te mantenga caliente.||El frío aumentará después. Lleva algo abrigador." | split: "||" -%}
+{%- assign hints_colder_10_es = "Más tarde llega el frío: tu outfit necesita refuerzos.||El termómetro va para abajo. Ponte algo abrigador antes de quejarte.||Se viene frío de verdad. Añade una capa y evita hacerte el valiente." | split: "||" -%}
+{%- assign hints_colder_11_es = "El frío viene a cobrarte todo. Abrígate o conviértete en estatua temblorosa.||La tarde se enfría sin piedad. Pon todas las capas y acepta tu destino.||Se viene un frío miserable. Abrígate bien o pasa la tarde tiritando como si fuera tu trabajo." | split: "||" -%}
+{%- assign hints_colder_mid_0_es = "Más tarde refrescará un poco. Lleva una capa ligera.||La temperatura bajará moderadamente. Una capa extra debería bastar.||Se viene un descenso suave. Ten algo ligero para abrigarte." | split: "||" -%}
+{%- assign hints_colder_mid_10_es = "Más tarde el clima baja un cambio. Lleva una casaca ligera y no hagas drama.||Se viene un fresquito manejable: una capa extra y listo.||Refrescará, pero no hace falta vestirse para el Polo Norte. Lleva una capa ligera." | split: "||" -%}
+{%- assign hints_colder_mid_11_es = "El frío llega con modestia, pero llega. Ponte una capa o quédate tiritando por principios.||La tarde se pone antipática. Una capa ligera te salvará del papelón.||No es una expedición polar, pero tampoco es verano. Abrígate un poco." | split: "||" -%}
+{%- assign hints_colder_hot_0_es = "Más tarde bajará el calor. Podrás estar cómodo sin agregar capas.||Refrescará un poco, pero no necesitarás ropa abrigadora.||El calor disminuirá. Mantén el outfit ligero." | split: "||" -%}
+{%- assign hints_colder_hot_10_es = "Por fin el calor retrocede. No celebres poniéndote una chompa: todavía no hace frío.||Bajará la temperatura y tu ropa seguirá pudiendo respirar.||El horno baja la intensidad. No necesitas disfrazarte de invierno." | split: "||" -%}
+{%- assign hints_colder_hot_11_es = "El calor se retira, pero no confundas alivio con frío. Guarda el abrigo.||La temperatura deja de castigarte. Sigue ligero; no inventes una crisis invernal.||El infierno baja a modo tolerable. Tu outfit sigue siendo un trámite." | split: "||" -%}
+{%- assign hints_arc_0_es = "Se calentará durante el día y refrescará después. Usa capas que puedas quitarte y volver a ponerte.||La mañana pide abrigo y la tarde-noche volverá a enfriarse. Lleva una capa extra.||Más calor primero, más frío después. Vístete con flexibilidad." | split: "||" -%}
+{%- assign hints_arc_10_es = "Te vas a sacar capas y luego a arrepentirte. Lleva una extra para el regreso.||El día será una montaña rusa térmica. Capas removibles, porque el clima no se decide.||Calor al mediodía, frío en la noche: el pronóstico quiere que cargues ropa." | split: "||" -%}
+{%- assign hints_arc_11_es = "El clima te hará desvestirte y luego pedirte cuentas. Guarda una capa para la noche.||Primero sauna, después castigo. Vístete por capas o sufre en dos actos.||Tu outfit enfrentará una traición térmica. Quítate capas de día y recupéralas al anochecer." | split: "||" -%}
+{%- assign hints_wetter_0_es = "Más tarde aumentará la probabilidad de lluvia. Lleva impermeable o paraguas.||Se viene lluvia. Añade protección para mantenerte seco.||El clima se pondrá más húmedo. No salgas sin algo impermeable." | split: "||" -%}
+{%- assign hints_wetter_10_es = "Más tarde llueve; lleva paraguas, salvo que quieras bañarte vestido.||El cielo está preparando una emboscada de agua. Ponte algo impermeable.||Se viene lluvia. Tu outfit necesita defensa, no optimismo." | split: "||" -%}
+{%- assign hints_wetter_11_es = "El cielo planea arruinarte la tarde. Usa impermeable o acepta ser una sopa con zapatos.||Se viene un diluvio. Protege cada centímetro de dignidad textil.||La lluvia llega con malas intenciones. Paraguas, impermeable y cero fe en el cielo." | split: "||" -%}
+{%- assign hints_drier_0_es = "La lluvia terminará más tarde. Podrás guardar el impermeable cuando escampe.||El clima se irá secando. El paraguas pronto será innecesario.||Mejorará el tiempo. Podrás quitarte la protección contra la lluvia." | split: "||" -%}
+{%- assign hints_drier_10_es = "La lluvia se rinde. Guarda el paraguas y deja de vestirte como pescador.||Pronto se seca: tu paraguas se convertirá en un palo incómodo sin propósito.||Retira el impermeable cuando escampe, antes de que se vuelva tu personalidad." | split: "||" -%}
+{%- assign hints_drier_11_es = "El diluvio acabará y el impermeable será una carga mojada y absurda.||El cielo se queda sin municiones. Baja las defensas cuando escampe.||Volverá el tiempo seco. Quítate la armadura impermeable y vuelve a la vida normal." | split: "||" -%}
+{%- assign hints_wetter_warmer_0_es = "Más tarde llegarán lluvia y calor. Usa protección impermeable y ligera.||Se vienen chubascos cálidos. Lleva una casaca delgada o paraguas.||Estará húmedo y cálido. Evita el equipo de lluvia pesado." | split: "||" -%}
+{%- assign hints_wetter_warmer_10_es = "Se viene clima de sauna. El impermeable grueso te traicionará: lleva una capa ligera.||Lluvia cálida después. Necesitas una casaca, no un traje de sauna.||Lluvia y sudor harán equipo. Usa algo impermeable y respirable." | split: "||" -%}
+{%- assign hints_wetter_warmer_11_es = "Bienvenido a la fase pantano. Usa protección respirable o cocínate en silencio.||El aire se vuelve sopa. Vístete ligero y usa una capa impermeable que respire.||Calor y lluvia se aliaron contra ti. Elige una casaca ligera o conviértete en caldo." | split: "||" -%}
+{%- assign hints_wetter_colder_0_es = "Más tarde llegará lluvia fría. Lleva abrigo y protección impermeable.||Se viene frío y humedad. Lleva una capa térmica y algo para la lluvia.||El clima se pondrá feo. Refuerza tu outfit contra el frío y el agua." | split: "||" -%}
+{%- assign hints_wetter_colder_10_es = "Se acerca la temporada de barro. Empieza a construir tu fortaleza impermeable.||Llega frío y lluvia: vístete como pescador curtido.||Lluvia helada después. Vestirse ligero será una pésima idea." | split: "||" -%}
+{%- assign hints_wetter_colder_11_es = "La naturaleza quiere romperte. Lleva capas abrigadoras e impermeables, salvo que disfrutes sufrir.||La humedad calará hasta los huesos. Abrígate o tiembla como trapo mojado.||Frío y lluvia harán el peor equipo. Ponte abrigo e impermeable antes de arrepentirte." | split: "||" -%}
+{%- assign hints_drier_warmer_0_es = "Más tarde despejará y subirá la temperatura. Planea quitarte capas pesadas.||Parará la lluvia y llegará el calor. Ve quitándote capas poco a poco.||El tiempo mejorará y tu outfit podrá volverse más ligero." | split: "||" -%}
+{%- assign hints_drier_warmer_10_es = "El clima se disculpará después. Guarda el equipo de lluvia y sigue adelante.||De mojado a sudado: deja una ruta de escape para tus capas.||Cuando salga el sol, quítate la capa impermeable antes de empezar a hervir." | split: "||" -%}
+{%- assign hints_drier_warmer_11_es = "El cielo dejará de llorar y empezará a quemar. Quítate el impermeable o cocina en silencio.||El caos se acaba: abandona el equipo de supervivencia antes de sudar por gusto.||El clima cambia de régimen. Aligera el outfit o serás un monumento sudoroso a la mala planificación." | split: "||" -%}
+{%- assign hints_drier_colder_0_es = "La lluvia acabará y luego bajará la temperatura. Cambia el impermeable por abrigo.||Se secará mientras se enfría. Ten lista una capa abrigadora.||Despejará, pero hará más frío. Guarda una capa caliente para después de la lluvia." | split: "||" -%}
+{%- assign hints_drier_colder_10_es = "Se va el agua y llega el frío. Cambia el plástico por lana.||Después se seca y enfría. Cambia la defensa contra la lluvia por abrigo.||Tu paraguas se jubila y tus capas abrigadoras ascienden." | split: "||" -%}
+{%- assign hints_drier_colder_11_es = "Ya no habrá lluvia, solo frío crudo. Abrígate ahora: tu yo del futuro se quejará.||El pronóstico se pone frío y malvado. Abrígate; al viento no le importa tu outfit.||Se acaba la humedad, pero el frío se queda. Ajusta tus expectativas y tus capas." | split: "||" -%}
+
+{%- comment %}
+Note to self:
+Pick active hint libraries based on lang.
+  {%- comment %} Concise Spanish wording for all sarcasm levels {% endcomment %}
+  {%- assign hints_perfect_0_es = "El clima se mantiene estable. Este conjunto te sirve todo el día.||El pronóstico no cambia. No necesitas cambiarte.||Puedes mantener las mismas capas por el resto del día." | split: "||" -%}
+  {%- assign hints_perfect_10_es = hints_perfect_0_es -%}
+  {%- assign hints_perfect_11_es = hints_perfect_0_es -%}
+  {%- assign hints_warmer_0_es = "Más tarde subirá la temperatura. Usa capas fáciles de quitar.||Se pondrá más cálido. Evita las capas gruesas.||Quítate una capa cuando aumente el calor." | split: "||" -%}
+  {%- assign hints_warmer_10_es = hints_warmer_0_es -%}
+  {%- assign hints_warmer_11_es = hints_warmer_0_es -%}
+  {%- assign hints_warmer_cold_0_es = "Subirá un poco la temperatura, pero seguirá haciendo frío. Mantén el abrigo.||Hará menos frío, pero todavía necesitarás ropa abrigadora.||No cambies tu conjunto: seguirá haciendo frío." | split: "||" -%}
+  {%- assign hints_warmer_cold_10_es = hints_warmer_cold_0_es -%}
+  {%- assign hints_warmer_cold_11_es = hints_warmer_cold_0_es -%}
+  {%- assign hints_warmer_hot_0_es = "Más tarde hará más calor. Usa ropa ligera, busca sombra y toma agua.||El calor aumentará. Prioriza sombra, bloqueador y agua.||No necesitas más capas; protégete del sol e hidrátate." | split: "||" -%}
+  {%- assign hints_warmer_hot_10_es = hints_warmer_hot_0_es -%}
+  {%- assign hints_warmer_hot_11_es = hints_warmer_hot_0_es -%}
+  {%- assign hints_colder_0_es = "Más tarde bajará la temperatura. Lleva una capa abrigadora.||Se viene más frío. Agrega una capa.||Abrígate para la tarde." | split: "||" -%}
+  {%- assign hints_colder_10_es = hints_colder_0_es -%}
+  {%- assign hints_colder_11_es = hints_colder_0_es -%}
+  {%- assign hints_colder_mid_0_es = "Más tarde refrescará. Lleva una capa ligera.||Bajará un poco la temperatura. Una capa extra será suficiente.||Ten una casaca ligera para más tarde." | split: "||" -%}
+  {%- assign hints_colder_mid_10_es = hints_colder_mid_0_es -%}
+  {%- assign hints_colder_mid_11_es = hints_colder_mid_0_es -%}
+  {%- assign hints_colder_hot_0_es = "Bajará el calor, pero no hará frío. Mantén la ropa ligera.||Refrescará un poco. No necesitas ropa abrigadora.||El calor disminuirá; conserva tu conjunto ligero." | split: "||" -%}
+  {%- assign hints_colder_hot_10_es = hints_colder_hot_0_es -%}
+  {%- assign hints_colder_hot_11_es = hints_colder_hot_0_es -%}
+  {%- assign hints_arc_0_es = "Hará más calor durante el día y refrescará después. Usa capas removibles y lleva una extra.||Quítate capas cuando suba la temperatura y vuelve a ponértelas en la noche.||Lleva ropa adaptable: calor primero y frío después." | split: "||" -%}
+  {%- assign hints_arc_10_es = hints_arc_0_es -%}
+  {%- assign hints_arc_11_es = hints_arc_0_es -%}
+  {%- assign hints_wetter_0_es = "Aumentará la probabilidad de lluvia. Lleva paraguas o impermeable.||Se viene lluvia. Protege tu ropa con una casaca impermeable.||No salgas sin paraguas o protección contra la lluvia." | split: "||" -%}
+  {%- assign hints_wetter_10_es = hints_wetter_0_es -%}
+  {%- assign hints_wetter_11_es = hints_wetter_0_es -%}
+  {%- assign hints_drier_0_es = "La lluvia terminará más tarde. Podrás guardar el paraguas.||El clima se volverá más seco. Guarda el impermeable cuando escampe.||Cuando pare la lluvia, quítate la protección impermeable." | split: "||" -%}
+  {%- assign hints_drier_10_es = hints_drier_0_es -%}
+  {%- assign hints_drier_11_es = hints_drier_0_es -%}
+  {%- assign hints_wetter_warmer_0_es = "Más tarde habrá lluvia y calor. Lleva una casaca impermeable y ligera.||Estará húmedo y cálido. Evita la ropa de lluvia gruesa.||Usa una capa impermeable, ligera y respirable." | split: "||" -%}
+  {%- assign hints_wetter_warmer_10_es = hints_wetter_warmer_0_es -%}
+  {%- assign hints_wetter_warmer_11_es = hints_wetter_warmer_0_es -%}
+  {%- assign hints_wetter_colder_0_es = "Más tarde habrá lluvia y frío. Lleva abrigo y protección impermeable.||Se viene frío y humedad. Usa una capa abrigadora y una casaca impermeable.||Abrígate y protege tu ropa de la lluvia." | split: "||" -%}
+  {%- assign hints_wetter_colder_10_es = hints_wetter_colder_0_es -%}
+  {%- assign hints_wetter_colder_11_es = hints_wetter_colder_0_es -%}
+  {%- assign hints_drier_warmer_0_es = "Más tarde dejará de llover y subirá la temperatura. Quítate las capas pesadas.||El clima mejorará y se pondrá más cálido. Usa ropa más ligera.||Cuando salga el sol, guarda la ropa impermeable." | split: "||" -%}
+  {%- assign hints_drier_warmer_10_es = hints_drier_warmer_0_es -%}
+  {%- assign hints_drier_warmer_11_es = hints_drier_warmer_0_es -%}
+  {%- assign hints_drier_colder_0_es = "La lluvia terminará y bajará la temperatura. Cambia el impermeable por una capa abrigadora.||Se volverá más seco y frío. Ten abrigo listo.||Cuando pare la lluvia, mantén una capa abrigadora." | split: "||" -%}
+  {%- assign hints_drier_colder_10_es = hints_drier_colder_0_es -%}
+  {%- assign hints_drier_colder_11_es = hints_drier_colder_0_es -%}
+
+Fallback to EN if DE is missing/empty.
+{%- endcomment -%}
+
+{%- assign hints_perfect_0_es = "El clima se mantiene estable. Este conjunto te sirve todo el día.||El pronóstico no cambia. No necesitas cambiarte.||Puedes mantener las mismas capas por el resto del día." | split: "||" -%}
+{%- assign hints_perfect_10_es = hints_perfect_0_es -%}
+{%- assign hints_perfect_11_es = hints_perfect_0_es -%}
+{%- assign hints_warmer_0_es = "Más tarde subirá la temperatura. Usa capas fáciles de quitar.||Se pondrá más cálido. Evita las capas gruesas.||Quítate una capa cuando aumente el calor." | split: "||" -%}
+{%- assign hints_warmer_10_es = hints_warmer_0_es -%}
+{%- assign hints_warmer_11_es = hints_warmer_0_es -%}
+{%- assign hints_warmer_cold_0_es = "Subirá un poco la temperatura, pero seguirá haciendo frío. Mantén el abrigo.||Hará menos frío, pero todavía necesitarás ropa abrigadora.||No cambies tu conjunto: seguirá haciendo frío." | split: "||" -%}
+{%- assign hints_warmer_cold_10_es = hints_warmer_cold_0_es -%}
+{%- assign hints_warmer_cold_11_es = hints_warmer_cold_0_es -%}
+{%- assign hints_warmer_hot_0_es = "Más tarde hará más calor. Usa ropa ligera, busca sombra y toma agua.||El calor aumentará. Prioriza sombra, bloqueador y agua.||No necesitas más capas; protégete del sol e hidrátate." | split: "||" -%}
+{%- assign hints_warmer_hot_10_es = hints_warmer_hot_0_es -%}
+{%- assign hints_warmer_hot_11_es = hints_warmer_hot_0_es -%}
+{%- assign hints_colder_0_es = "Más tarde bajará la temperatura. Lleva una capa abrigadora.||Se viene más frío. Agrega una capa.||Abrígate para la tarde." | split: "||" -%}
+{%- assign hints_colder_10_es = hints_colder_0_es -%}
+{%- assign hints_colder_11_es = hints_colder_0_es -%}
+{%- assign hints_colder_mid_0_es = "Más tarde refrescará. Lleva una capa ligera.||Bajará un poco la temperatura. Una capa extra será suficiente.||Ten una casaca ligera para más tarde." | split: "||" -%}
+{%- assign hints_colder_mid_10_es = hints_colder_mid_0_es -%}
+{%- assign hints_colder_mid_11_es = hints_colder_mid_0_es -%}
+{%- assign hints_colder_hot_0_es = "Bajará el calor, pero no hará frío. Mantén la ropa ligera.||Refrescará un poco. No necesitas ropa abrigadora.||El calor disminuirá; conserva tu conjunto ligero." | split: "||" -%}
+{%- assign hints_colder_hot_10_es = hints_colder_hot_0_es -%}
+{%- assign hints_colder_hot_11_es = hints_colder_hot_0_es -%}
+{%- assign hints_arc_0_es = "Hará más calor durante el día y refrescará después. Usa capas removibles y lleva una extra.||Quítate capas cuando suba la temperatura y vuelve a ponértelas en la noche.||Lleva ropa adaptable: calor primero y frío después." | split: "||" -%}
+{%- assign hints_arc_10_es = hints_arc_0_es -%}
+{%- assign hints_arc_11_es = hints_arc_0_es -%}
+{%- assign hints_wetter_0_es = "Aumentará la probabilidad de lluvia. Lleva paraguas o impermeable.||Se viene lluvia. Protege tu ropa con una casaca impermeable.||No salgas sin paraguas o protección contra la lluvia." | split: "||" -%}
+{%- assign hints_wetter_10_es = hints_wetter_0_es -%}
+{%- assign hints_wetter_11_es = hints_wetter_0_es -%}
+{%- assign hints_drier_0_es = "La lluvia terminará más tarde. Podrás guardar el paraguas.||El clima se volverá más seco. Guarda el impermeable cuando escampe.||Cuando pare la lluvia, quítate la protección impermeable." | split: "||" -%}
+{%- assign hints_drier_10_es = hints_drier_0_es -%}
+{%- assign hints_drier_11_es = hints_drier_0_es -%}
+{%- assign hints_wetter_warmer_0_es = "Más tarde habrá lluvia y calor. Lleva una casaca impermeable y ligera.||Estará húmedo y cálido. Evita la ropa de lluvia gruesa.||Usa una capa impermeable, ligera y respirable." | split: "||" -%}
+{%- assign hints_wetter_warmer_10_es = hints_wetter_warmer_0_es -%}
+{%- assign hints_wetter_warmer_11_es = hints_wetter_warmer_0_es -%}
+{%- assign hints_wetter_colder_0_es = "Más tarde habrá lluvia y frío. Lleva abrigo y protección impermeable.||Se viene frío y humedad. Usa una capa abrigadora y una casaca impermeable.||Abrígate y protege tu ropa de la lluvia." | split: "||" -%}
+{%- assign hints_wetter_colder_10_es = hints_wetter_colder_0_es -%}
+{%- assign hints_wetter_colder_11_es = hints_wetter_colder_0_es -%}
+{%- assign hints_drier_warmer_0_es = "Más tarde dejará de llover y subirá la temperatura. Quítate las capas pesadas.||El clima mejorará y se pondrá más cálido. Usa ropa más ligera.||Cuando salga el sol, guarda la ropa impermeable." | split: "||" -%}
+{%- assign hints_drier_warmer_10_es = hints_drier_warmer_0_es -%}
+{%- assign hints_drier_warmer_11_es = hints_drier_warmer_0_es -%}
+{%- assign hints_drier_colder_0_es = "La lluvia terminará y bajará la temperatura. Cambia el impermeable por una capa abrigadora.||Se volverá más seco y frío. Ten abrigo listo.||Cuando pare la lluvia, mantén una capa abrigadora." | split: "||" -%}
+{%- assign hints_drier_colder_10_es = hints_drier_colder_0_es -%}
+{%- assign hints_drier_colder_11_es = hints_drier_colder_0_es -%}
+
+{%- assign hints_perfect_0 = hints_perfect_0_en -%}
+{%- assign hints_perfect_10 = hints_perfect_10_en -%}
+{%- assign hints_perfect_11 = hints_perfect_11_en -%}
+{%- assign hints_warmer_0 = hints_warmer_0_en -%}
+{%- assign hints_warmer_10 = hints_warmer_10_en -%}
+{%- assign hints_warmer_11 = hints_warmer_11_en -%}
+{%- assign hints_warmer_cold_0 = hints_warmer_cold_0_en -%}
+{%- assign hints_warmer_cold_10 = hints_warmer_cold_10_en -%}
+{%- assign hints_warmer_cold_11 = hints_warmer_cold_11_en -%}
+{%- assign hints_warmer_hot_0 = hints_warmer_hot_0_en -%}
+{%- assign hints_warmer_hot_10 = hints_warmer_hot_10_en -%}
+{%- assign hints_warmer_hot_11 = hints_warmer_hot_11_en -%}
+{%- assign hints_colder_0 = hints_colder_0_en -%}
+{%- assign hints_colder_10 = hints_colder_10_en -%}
+{%- assign hints_colder_11 = hints_colder_11_en -%}
+{%- assign hints_colder_mid_0 = hints_colder_mid_0_en -%}
+{%- assign hints_colder_mid_10 = hints_colder_mid_10_en -%}
+{%- assign hints_colder_mid_11 = hints_colder_mid_11_en -%}
+{%- assign hints_colder_hot_0 = hints_colder_hot_0_en -%}
+{%- assign hints_colder_hot_10 = hints_colder_hot_10_en -%}
+{%- assign hints_colder_hot_11 = hints_colder_hot_11_en -%}
+{%- assign hints_arc_0 = hints_arc_0_en -%}
+{%- assign hints_arc_10 = hints_arc_10_en -%}
+{%- assign hints_arc_11 = hints_arc_11_en -%}
+{%- assign hints_wetter_0 = hints_wetter_0_en -%}
+{%- assign hints_wetter_10 = hints_wetter_10_en -%}
+{%- assign hints_wetter_11 = hints_wetter_11_en -%}
+{%- assign hints_drier_0 = hints_drier_0_en -%}
+{%- assign hints_drier_10 = hints_drier_10_en -%}
+{%- assign hints_drier_11 = hints_drier_11_en -%}
+{%- assign hints_wetter_warmer_0 = hints_wetter_warmer_0_en -%}
+{%- assign hints_wetter_warmer_10 = hints_wetter_warmer_10_en -%}
+{%- assign hints_wetter_warmer_11 = hints_wetter_warmer_11_en -%}
+{%- assign hints_wetter_colder_0 = hints_wetter_colder_0_en -%}
+{%- assign hints_wetter_colder_10 = hints_wetter_colder_10_en -%}
+{%- assign hints_wetter_colder_11 = hints_wetter_colder_11_en -%}
+{%- assign hints_drier_warmer_0 = hints_drier_warmer_0_en -%}
+{%- assign hints_drier_warmer_10 = hints_drier_warmer_10_en -%}
+{%- assign hints_drier_warmer_11 = hints_drier_warmer_11_en -%}
+{%- assign hints_drier_colder_0 = hints_drier_colder_0_en -%}
+{%- assign hints_drier_colder_10 = hints_drier_colder_10_en -%}
+{%- assign hints_drier_colder_11 = hints_drier_colder_11_en -%}
+
+  {%- if lang == 'es' -%}
+    {%- assign hints_perfect_0 = hints_perfect_0_es -%}
+    {%- assign hints_perfect_10 = hints_perfect_10_es -%}
+    {%- assign hints_perfect_11 = hints_perfect_11_es -%}
+    {%- assign hints_warmer_0 = hints_warmer_0_es -%}
+    {%- assign hints_warmer_10 = hints_warmer_10_es -%}
+    {%- assign hints_warmer_11 = hints_warmer_11_es -%}
+    {%- assign hints_warmer_cold_0 = hints_warmer_cold_0_es -%}
+    {%- assign hints_warmer_cold_10 = hints_warmer_cold_10_es -%}
+    {%- assign hints_warmer_cold_11 = hints_warmer_cold_11_es -%}
+    {%- assign hints_warmer_hot_0 = hints_warmer_hot_0_es -%}
+    {%- assign hints_warmer_hot_10 = hints_warmer_hot_10_es -%}
+    {%- assign hints_warmer_hot_11 = hints_warmer_hot_11_es -%}
+    {%- assign hints_colder_0 = hints_colder_0_es -%}
+    {%- assign hints_colder_10 = hints_colder_10_es -%}
+    {%- assign hints_colder_11 = hints_colder_11_es -%}
+    {%- assign hints_colder_mid_0 = hints_colder_mid_0_es -%}
+    {%- assign hints_colder_mid_10 = hints_colder_mid_10_es -%}
+    {%- assign hints_colder_mid_11 = hints_colder_mid_11_es -%}
+    {%- assign hints_colder_hot_0 = hints_colder_hot_0_es -%}
+    {%- assign hints_colder_hot_10 = hints_colder_hot_10_es -%}
+    {%- assign hints_colder_hot_11 = hints_colder_hot_11_es -%}
+    {%- assign hints_arc_0 = hints_arc_0_es -%}
+    {%- assign hints_arc_10 = hints_arc_10_es -%}
+    {%- assign hints_arc_11 = hints_arc_11_es -%}
+    {%- assign hints_wetter_0 = hints_wetter_0_es -%}
+    {%- assign hints_wetter_10 = hints_wetter_10_es -%}
+    {%- assign hints_wetter_11 = hints_wetter_11_es -%}
+    {%- assign hints_drier_0 = hints_drier_0_es -%}
+    {%- assign hints_drier_10 = hints_drier_10_es -%}
+    {%- assign hints_drier_11 = hints_drier_11_es -%}
+    {%- assign hints_wetter_warmer_0 = hints_wetter_warmer_0_es -%}
+    {%- assign hints_wetter_warmer_10 = hints_wetter_warmer_10_es -%}
+    {%- assign hints_wetter_warmer_11 = hints_wetter_warmer_11_es -%}
+    {%- assign hints_wetter_colder_0 = hints_wetter_colder_0_es -%}
+    {%- assign hints_wetter_colder_10 = hints_wetter_colder_10_es -%}
+    {%- assign hints_wetter_colder_11 = hints_wetter_colder_11_es -%}
+    {%- assign hints_drier_warmer_0 = hints_drier_warmer_0_es -%}
+    {%- assign hints_drier_warmer_10 = hints_drier_warmer_10_es -%}
+    {%- assign hints_drier_warmer_11 = hints_drier_warmer_11_es -%}
+    {%- assign hints_drier_colder_0 = hints_drier_colder_0_es -%}
+    {%- assign hints_drier_colder_10 = hints_drier_colder_10_es -%}
+    {%- assign hints_drier_colder_11 = hints_drier_colder_11_es -%}
+  {%- elsif lang == 'de' -%}
+  {%- if hints_perfect_0_de.size > 1 or hints_perfect_0_de[0] != '' -%}{%- assign hints_perfect_0 = hints_perfect_0_de -%}{%- endif -%}
+  {%- if hints_perfect_10_de.size > 1 or hints_perfect_10_de[0] != '' -%}{%- assign hints_perfect_10 = hints_perfect_10_de -%}{%- endif -%}
+  {%- if hints_perfect_11_de.size > 1 or hints_perfect_11_de[0] != '' -%}{%- assign hints_perfect_11 = hints_perfect_11_de -%}{%- endif -%}
+
+  {%- if hints_warmer_0_de.size > 1 or hints_warmer_0_de[0] != '' -%}{%- assign hints_warmer_0 = hints_warmer_0_de -%}{%- endif -%}
+  {%- if hints_warmer_10_de.size > 1 or hints_warmer_10_de[0] != '' -%}{%- assign hints_warmer_10 = hints_warmer_10_de -%}{%- endif -%}
+  {%- if hints_warmer_11_de.size > 1 or hints_warmer_11_de[0] != '' -%}{%- assign hints_warmer_11 = hints_warmer_11_de -%}{%- endif -%}
+
+  {%- if hints_warmer_cold_0_de.size > 1 or hints_warmer_cold_0_de[0] != '' -%}{%- assign hints_warmer_cold_0 = hints_warmer_cold_0_de -%}{%- endif -%}
+  {%- if hints_warmer_cold_10_de.size > 1 or hints_warmer_cold_10_de[0] != '' -%}{%- assign hints_warmer_cold_10 = hints_warmer_cold_10_de -%}{%- endif -%}
+  {%- if hints_warmer_cold_11_de.size > 1 or hints_warmer_cold_11_de[0] != '' -%}{%- assign hints_warmer_cold_11 = hints_warmer_cold_11_de -%}{%- endif -%}
+
+  {%- if hints_warmer_hot_0_de.size > 1 or hints_warmer_hot_0_de[0] != '' -%}{%- assign hints_warmer_hot_0 = hints_warmer_hot_0_de -%}{%- endif -%}
+  {%- if hints_warmer_hot_10_de.size > 1 or hints_warmer_hot_10_de[0] != '' -%}{%- assign hints_warmer_hot_10 = hints_warmer_hot_10_de -%}{%- endif -%}
+  {%- if hints_warmer_hot_11_de.size > 1 or hints_warmer_hot_11_de[0] != '' -%}{%- assign hints_warmer_hot_11 = hints_warmer_hot_11_de -%}{%- endif -%}
+
+  {%- if hints_colder_0_de.size > 1 or hints_colder_0_de[0] != '' -%}{%- assign hints_colder_0 = hints_colder_0_de -%}{%- endif -%}
+  {%- if hints_colder_10_de.size > 1 or hints_colder_10_de[0] != '' -%}{%- assign hints_colder_10 = hints_colder_10_de -%}{%- endif -%}
+  {%- if hints_colder_11_de.size > 1 or hints_colder_11_de[0] != '' -%}{%- assign hints_colder_11 = hints_colder_11_de -%}{%- endif -%}
+
+  {%- if hints_colder_mid_0_de.size > 1 or hints_colder_mid_0_de[0] != '' -%}{%- assign hints_colder_mid_0 = hints_colder_mid_0_de -%}{%- endif -%}
+  {%- if hints_colder_mid_10_de.size > 1 or hints_colder_mid_10_de[0] != '' -%}{%- assign hints_colder_mid_10 = hints_colder_mid_10_de -%}{%- endif -%}
+  {%- if hints_colder_mid_11_de.size > 1 or hints_colder_mid_11_de[0] != '' -%}{%- assign hints_colder_mid_11 = hints_colder_mid_11_de -%}{%- endif -%}
+
+  {%- if hints_colder_hot_0_de.size > 1 or hints_colder_hot_0_de[0] != '' -%}{%- assign hints_colder_hot_0 = hints_colder_hot_0_de -%}{%- endif -%}
+  {%- if hints_colder_hot_10_de.size > 1 or hints_colder_hot_10_de[0] != '' -%}{%- assign hints_colder_hot_10 = hints_colder_hot_10_de -%}{%- endif -%}
+  {%- if hints_colder_hot_11_de.size > 1 or hints_colder_hot_11_de[0] != '' -%}{%- assign hints_colder_hot_11 = hints_colder_hot_11_de -%}{%- endif -%}
+
+  {%- if hints_arc_0_de.size > 1 or hints_arc_0_de[0] != '' -%}{%- assign hints_arc_0 = hints_arc_0_de -%}{%- endif -%}
+  {%- if hints_arc_10_de.size > 1 or hints_arc_10_de[0] != '' -%}{%- assign hints_arc_10 = hints_arc_10_de -%}{%- endif -%}
+  {%- if hints_arc_11_de.size > 1 or hints_arc_11_de[0] != '' -%}{%- assign hints_arc_11 = hints_arc_11_de -%}{%- endif -%}
+
+  {%- if hints_wetter_0_de.size > 1 or hints_wetter_0_de[0] != '' -%}{%- assign hints_wetter_0 = hints_wetter_0_de -%}{%- endif -%}
+  {%- if hints_wetter_10_de.size > 1 or hints_wetter_10_de[0] != '' -%}{%- assign hints_wetter_10 = hints_wetter_10_de -%}{%- endif -%}
+  {%- if hints_wetter_11_de.size > 1 or hints_wetter_11_de[0] != '' -%}{%- assign hints_wetter_11 = hints_wetter_11_de -%}{%- endif -%}
+
+  {%- if hints_drier_0_de.size > 1 or hints_drier_0_de[0] != '' -%}{%- assign hints_drier_0 = hints_drier_0_de -%}{%- endif -%}
+  {%- if hints_drier_10_de.size > 1 or hints_drier_10_de[0] != '' -%}{%- assign hints_drier_10 = hints_drier_10_de -%}{%- endif -%}
+  {%- if hints_drier_11_de.size > 1 or hints_drier_11_de[0] != '' -%}{%- assign hints_drier_11 = hints_drier_11_de -%}{%- endif -%}
+
+  {%- if hints_wetter_warmer_0_de.size > 1 or hints_wetter_warmer_0_de[0] != '' -%}{%- assign hints_wetter_warmer_0 = hints_wetter_warmer_0_de -%}{%- endif -%}
+  {%- if hints_wetter_warmer_10_de.size > 1 or hints_wetter_warmer_10_de[0] != '' -%}{%- assign hints_wetter_warmer_10 = hints_wetter_warmer_10_de -%}{%- endif -%}
+  {%- if hints_wetter_warmer_11_de.size > 1 or hints_wetter_warmer_11_de[0] != '' -%}{%- assign hints_wetter_warmer_11 = hints_wetter_warmer_11_de -%}{%- endif -%}
+
+  {%- if hints_wetter_colder_0_de.size > 1 or hints_wetter_colder_0_de[0] != '' -%}{%- assign hints_wetter_colder_0 = hints_wetter_colder_0_de -%}{%- endif -%}
+  {%- if hints_wetter_colder_10_de.size > 1 or hints_wetter_colder_10_de[0] != '' -%}{%- assign hints_wetter_colder_10 = hints_wetter_colder_10_de -%}{%- endif -%}
+  {%- if hints_wetter_colder_11_de.size > 1 or hints_wetter_colder_11_de[0] != '' -%}{%- assign hints_wetter_colder_11 = hints_wetter_colder_11_de -%}{%- endif -%}
+
+  {%- if hints_drier_warmer_0_de.size > 1 or hints_drier_warmer_0_de[0] != '' -%}{%- assign hints_drier_warmer_0 = hints_drier_warmer_0_de -%}{%- endif -%}
+  {%- if hints_drier_warmer_10_de.size > 1 or hints_drier_warmer_10_de[0] != '' -%}{%- assign hints_drier_warmer_10 = hints_drier_warmer_10_de -%}{%- endif -%}
+  {%- if hints_drier_warmer_11_de.size > 1 or hints_drier_warmer_11_de[0] != '' -%}{%- assign hints_drier_warmer_11 = hints_drier_warmer_11_de -%}{%- endif -%}
+
+  {%- if hints_drier_colder_0_de.size > 1 or hints_drier_colder_0_de[0] != '' -%}{%- assign hints_drier_colder_0 = hints_drier_colder_0_de -%}{%- endif -%}
+  {%- if hints_drier_colder_10_de.size > 1 or hints_drier_colder_10_de[0] != '' -%}{%- assign hints_drier_colder_10 = hints_drier_colder_10_de -%}{%- endif -%}
+  {%- if hints_drier_colder_11_de.size > 1 or hints_drier_colder_11_de[0] != '' -%}{%- assign hints_drier_colder_11 = hints_drier_colder_11_de -%}{%- endif -%}
+{%- endif -%}
+
+{%- comment %}
+Note to self:
+Pick today_tip from the correct array based on scenario and sarcasm_level.
+I use local_days modulo array size so the variant stays stable for this day.
+{%- endcomment %}
+
+{%- if is_error == false and show_future_suggestions == 'on' -%}
+  {%- assign arr = nil -%}
+
+  {%- if sarcasm_level == '0' -%}
+    {%- if scenario == 'perfect' -%}
+      {%- assign arr = hints_perfect_0 -%}
+    {%- elsif scenario == 'arc' -%}
+      {%- assign arr = hints_arc_0 -%}
+    {%- elsif scenario == 'warmer_cold' -%}
+      {%- assign arr = hints_warmer_cold_0 -%}
+    {%- elsif scenario == 'warmer' -%}
+      {%- assign arr = hints_warmer_0 -%}
+    {%- elsif scenario == 'warmer_hot' -%}
+      {%- assign arr = hints_warmer_hot_0 -%}
+    {%- elsif scenario == 'colder' -%}
+      {%- assign arr = hints_colder_0 -%}
+    {%- elsif scenario == 'colder_mid' -%}
+      {%- assign arr = hints_colder_mid_0 -%}
+    {%- elsif scenario == 'colder_hot' -%}
+      {%- assign arr = hints_colder_hot_0 -%}
+    {%- elsif scenario == 'wetter' -%}
+      {%- assign arr = hints_wetter_0 -%}
+    {%- elsif scenario == 'drier' -%}
+      {%- assign arr = hints_drier_0 -%}
+    {%- elsif scenario == 'wetter_warmer' -%}
+      {%- assign arr = hints_wetter_warmer_0 -%}
+    {%- elsif scenario == 'wetter_colder' -%}
+      {%- assign arr = hints_wetter_colder_0 -%}
+    {%- elsif scenario == 'drier_warmer' -%}
+      {%- assign arr = hints_drier_warmer_0 -%}
+    {%- elsif scenario == 'drier_colder' -%}
+      {%- assign arr = hints_drier_colder_0 -%}
+    {%- endif -%}
+  {%- elsif sarcasm_level == '10' -%}
+    {%- if scenario == 'perfect' -%}
+      {%- assign arr = hints_perfect_10 -%}
+    {%- elsif scenario == 'arc' -%}
+      {%- assign arr = hints_arc_10 -%}
+    {%- elsif scenario == 'warmer_cold' -%}
+      {%- assign arr = hints_warmer_cold_10 -%}
+    {%- elsif scenario == 'warmer' -%}
+      {%- assign arr = hints_warmer_10 -%}
+    {%- elsif scenario == 'warmer_hot' -%}
+      {%- assign arr = hints_warmer_hot_10 -%}
+    {%- elsif scenario == 'colder' -%}
+      {%- assign arr = hints_colder_10 -%}
+    {%- elsif scenario == 'colder_mid' -%}
+      {%- assign arr = hints_colder_mid_10 -%}
+    {%- elsif scenario == 'colder_hot' -%}
+      {%- assign arr = hints_colder_hot_10 -%}
+    {%- elsif scenario == 'wetter' -%}
+      {%- assign arr = hints_wetter_10 -%}
+    {%- elsif scenario == 'drier' -%}
+      {%- assign arr = hints_drier_10 -%}
+    {%- elsif scenario == 'wetter_warmer' -%}
+      {%- assign arr = hints_wetter_warmer_10 -%}
+    {%- elsif scenario == 'wetter_colder' -%}
+      {%- assign arr = hints_wetter_colder_10 -%}
+    {%- elsif scenario == 'drier_warmer' -%}
+      {%- assign arr = hints_drier_warmer_10 -%}
+    {%- elsif scenario == 'drier_colder' -%}
+      {%- assign arr = hints_drier_colder_10 -%}
+    {%- endif -%}
+  {%- elsif sarcasm_level == '11' -%}
+    {%- if scenario == 'perfect' -%}
+      {%- assign arr = hints_perfect_11 -%}
+    {%- elsif scenario == 'arc' -%}
+      {%- assign arr = hints_arc_11 -%}
+    {%- elsif scenario == 'warmer_cold' -%}
+      {%- assign arr = hints_warmer_cold_11 -%}
+    {%- elsif scenario == 'warmer' -%}
+      {%- assign arr = hints_warmer_11 -%}
+    {%- elsif scenario == 'warmer_hot' -%}
+      {%- assign arr = hints_warmer_hot_11 -%}
+    {%- elsif scenario == 'colder' -%}
+      {%- assign arr = hints_colder_11 -%}
+    {%- elsif scenario == 'colder_mid' -%}
+      {%- assign arr = hints_colder_mid_11 -%}
+    {%- elsif scenario == 'colder_hot' -%}
+      {%- assign arr = hints_colder_hot_11 -%}
+    {%- elsif scenario == 'wetter' -%}
+      {%- assign arr = hints_wetter_11 -%}
+    {%- elsif scenario == 'drier' -%}
+      {%- assign arr = hints_drier_11 -%}
+    {%- elsif scenario == 'wetter_warmer' -%}
+      {%- assign arr = hints_wetter_warmer_11 -%}
+    {%- elsif scenario == 'wetter_colder' -%}
+      {%- assign arr = hints_wetter_colder_11 -%}
+    {%- elsif scenario == 'drier_warmer' -%}
+      {%- assign arr = hints_drier_warmer_11 -%}
+    {%- elsif scenario == 'drier_colder' -%}
+      {%- assign arr = hints_drier_colder_11 -%}
+    {%- endif -%}
+  {%- endif -%}
+
+  {%- if arr != nil -%}
+    {%- assign n = arr | size -%}
+    {%- if n > 0 -%}
+      {%- assign idx = local_days | modulo: n -%}
+      {%- assign today_tip = arr[idx] -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+
+{%- assign active_theme = '' -%}
+
+{%- comment %}
+New Year (Dec 31 and Jan 1)
+Prefix: ny_
+{%- endcomment %}
+
+{%- if today_md == '12-31' or today_md == '01-01' %}
+  {%- assign active_theme = 'ny' -%}
+{%- endif %}
+
+{%- comment %}
+Groundhog Day (Feb 2)
+Prefix: ghd_
+{%- endcomment %}
+
+{%- if today_md == '02-02' %}
+  {%- assign active_theme = 'ghd' -%}
+{%- endif %}
+
+{%- comment %}
+Pi Day (March 14)
+Prefix: pi_
+{%- endcomment %}
+
+{%- if today_md == '03-14' %}
+  {%- assign active_theme = 'pi' -%}
+{%- endif %}
+
+{%- comment %}
+May the Fourth be with you (May 4)
+Prefix: force_
+{%- endcomment %}
+
+{%- if today_md == '05-04' %}
+  {%- assign active_theme = 'force' -%}
+{%- endif %}
+
+{%- comment %}
+World Bicycle Day (June 03)
+Prefix: bike_
+{%- endcomment %}
+
+{%- if today_md == '06-03' %}
+  {%- assign active_theme = 'bike' -%}
+{%- endif %}
+
+{%- comment %}
+Tour de France (roughly Jul 1 to Jul 23)
+Prefix: tdf_
+Polka dot climber jersey, dots render perfectly in 1 bit
+{%- endcomment %}
+
+{%- if today_md >= '07-01' and today_md <= '07-23' %}
+  {%- assign active_theme = 'tdf' -%}
+{%- endif %}
+
+{%- comment %}
+Oktoberfest (late September to early October)
+Prefix: okt_
+{%- endcomment %}
+
+{%- if today_md >= '09-20' and today_md <= '10-05' %}
+  {%- assign active_theme = 'okt' -%}
+{%- endif %}
+
+{%- comment %}
+Halloween (Oct 31)
+Prefix: spooky_
+{%- endcomment %}
+
+{%- if today_md == '10-31' %}
+  {%- assign active_theme = 'spooky' -%}
+{%- endif %}
+
+{%- comment %}
+Thanksgiving (4th Thursday of November, computed)
+Prefix: thanks_
+weekday_idx: 0 = Sunday ... 4 = Thursday (epoch day 0 was a Thursday)
+4th Thursday always falls between Nov 22 and Nov 28
+{%- endcomment %}
+
+{%- assign weekday_idx = local_days | plus: 4 | modulo: 7 -%}
+{%- if today_md >= '11-22' and today_md <= '11-28' and weekday_idx == 4 %}
+  {%- assign active_theme = 'thanks' -%}
+{%- endif %}
+
+{%- comment %}
+Christmas (Dec 24 and 25)
+Prefix: xmas_
+{%- endcomment %}
+
+{%- comment %}
+Krampusnacht (Dec 5)
+Prefix: krampus_
+{%- endcomment %}
+
+{%- if today_md == '12-05' %}
+  {%- assign active_theme = 'krampus' -%}
+{%- endif %}
+
+{%- comment %}
+Nikolaustag (Dec 6)
+Prefix: nikolo_
+{%- endcomment %}
+
+{%- if today_md == '12-06' %}
+  {%- assign active_theme = 'nikolo' -%}
+{%- endif %}
+  
+{%- if today_md == '12-24' or today_md == '12-25' %}
+  {%- assign active_theme = 'xmas' -%}
+{%- endif %}
+  
+{%- comment %}
+Note to self:
+Pick the final sprite slug.
+By default I use weather_slug.
+If a theme is active and there is no error,
+I switch to "<theme>_<weather_slug>".
+{%- endcomment %}
+{%- comment %}
+Note to self:
+Theme whitelist. A theme only replaces the sprite for slugs I have
+actually drawn, everything else falls back to the base sprite
+instead of a broken image. 'ALL' means the full set exists.
+Slugs are wrapped in commas so the contains check cannot
+accidentally match hot_dry inside very_hot_dry.
+Add slugs as I draw them, e.g. ',freezing_dry,freezing_snow,cold_dry,'
+{%- endcomment %}
+{%- assign theme_whitelist = '' -%}
+{%- case active_theme -%}
+  {%- when 'ny' -%}
+    {%- assign theme_whitelist = 'ALL' -%}
+  {%- when 'pi' -%}
+    {%- assign theme_whitelist = 'ALL' -%}
+  {%- when 'force' -%}
+    {%- assign theme_whitelist = 'ALL' -%}
+  {%- when 'bike' -%}
+    {%- assign theme_whitelist = 'ALL' -%}
+  {%- when 'okt' -%}
+    {%- assign theme_whitelist = 'ALL' -%}
+  {%- when 'spooky' -%}
+    {%- assign theme_whitelist = 'ALL' -%}
+  {%- when 'thanks' -%}
+    {%- assign theme_whitelist = 'ALL' -%}
+  {%- when 'xmas' -%}
+    {%- assign theme_whitelist = 'ALL' -%}
+  {%- when 'ghd' -%}
+    {%- assign theme_whitelist = '' -%}
+  {%- when 'tdf' -%}
+    {%- assign theme_whitelist = '' -%}
+  {%- when 'krampus' -%}
+    {%- assign theme_whitelist = '' -%}
+  {%- when 'nikolo' -%}
+    {%- assign theme_whitelist = '' -%}
+{%- endcase -%}
+
+{%- assign sprite_slug = weather_slug -%}
+{%- if active_theme != '' and is_error == false -%}
+  {%- assign slug_probe = ',' | append: weather_slug | append: ',' -%}
+  {%- if theme_whitelist == 'ALL' or theme_whitelist contains slug_probe -%}
+    {%- assign sprite_slug = active_theme | append: '_' | append: weather_slug -%}
+  {%- endif -%}
+{%- endif -%}
+
+{%- if is_error -%}
+  {%- assign sprite_url = error_sprite_url -%}
+  {%- assign fallback_sprite_url = error_sprite_url -%}
+{%- else -%}
+  {%- assign sprite_url = sprite_base_url | append: sprite_slug | append: '.png' -%}
+  {%- comment %}
+  Note to self:
+  fallback_sprite_url is always the plain, untheme'd sprite.
+  The display markup can use it for an onerror fallback:
+  <img src="{{ sprite_url }}" onerror="this.onerror=null;this.src='{{ fallback_sprite_url }}'">
+  {%- endcomment %}
+  {%- assign fallback_sprite_url = sprite_base_url | append: weather_slug | append: '.png' -%}
+{%- endif -%}
+
+{%- assign outfit_title = 'What to Wear' -%}
+{%- if lang == 'de' -%}{%- assign outfit_title = 'Was anziehen?' -%}{%- endif -%}
+{%- if lang == 'es' -%}{%- assign outfit_title = 'Qué ponerse' -%}{%- endif -%}
