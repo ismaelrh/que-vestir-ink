@@ -1,4 +1,4 @@
-<div class="layout layout--row layout--center-x p--xs">
+<div class="layout layout--row layout--left p--xs">
 
   {% if is_error %}
      <div class="stretch-y h--min-0 flex flex--center-y flex--center-x w--100">
@@ -11,7 +11,7 @@
 
   {% else %}
 
-    <div class="stretch-y h--min-0 flex flex--center-y flex--center-x">
+    <div class="stretch-y h--min-0 flex flex--center-y flex--left w--[40cqw]">
       
       <img 
         class="image image-dither image--contain w--full h--full"
@@ -21,7 +21,7 @@
     </div>
 
     {% if show_future_suggestions == 'on' and today_tip != '' %}
-       <div class="title title--small outfit-tip text--center mt--xs">
+       <div class="title title--small outfit-tip text--center mt--xs w--[60cqw]">
         {{ today_tip }}
       </div>
     {% endif %}
