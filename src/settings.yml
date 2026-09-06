@@ -96,5 +96,5 @@ custom_fields:
   - Hide: 'off'
   description-de: Willst du die untere Titelleiste ausblenden oder anzeigen?
 name: Que vestir
-description: weather forecast with outfit tips (English, German, and Peruvian Spanish)
+description: Weather-based outfit tips
 refresh_interval: 15
